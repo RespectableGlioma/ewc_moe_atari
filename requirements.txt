@@ -3,8 +3,10 @@
 
 gymnasium>=1.0.0
 # Atari dependencies (may vary by platform)
-gymnasium[atari,accept-rom-license]
+gymnasium[atari]
+ale-py>=0.8.1
 
 torch>=2.1.0
+torchvision>=0.16.0
 numpy>=1.24
 opencv-python>=4.8
