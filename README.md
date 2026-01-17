@@ -8,7 +8,7 @@ This is a **research scaffold** you can run in **Google Colab** to test the idea
 - **Sparsity/modularity:** a **GRU router** gates a set of **experts** (MoE) producing Q-values.
 
 The code is intentionally modular so you can later:
-- swap the caching simulator for real HBM/DRAM/NVMe swapping,
+- experiment with **real expert paging** across GPU/CPU/disk (see `src/store/expert_store.py`),
 - plug in a better learner (IMPALA/V-trace, R2D2, etc.),
 - scale expert counts.
 
@@ -23,6 +23,15 @@ The code is intentionally modular so you can later:
 
 - `EWC_MoE_Atari.ipynb` — the Colab-friendly entry point
 - `src/` — importable python package with env building, model, replay, and training
+
+### New (out-of-core) components
+
+- `src/store/expert_store.py` — a simple **ExpertStore** that pages expert weights (and per-expert optimizer state) across:
+  - GPU (HBM) : limited by `hbm_expert_capacity`
+  - CPU (DRAM): limited by `dram_expert_capacity`
+  - Disk (NVMe): optional, enabled with `enable_nvme_tier=True`
+- `src/logging_utils/run_logger.py` — JSONL + TensorBoard logging
+- `src/viz/metrics.py` — helper to load logs into a Pandas DataFrame
 
 ## Notes
 

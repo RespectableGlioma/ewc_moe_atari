@@ -21,6 +21,10 @@ class EWC:
       - diag Fisher estimate (importance)
 
     During subsequent training, we add a quadratic penalty.
+
+    NOTE: This scaffold explicitly skips parameters currently on the 'meta' device.
+    That matters for our out-of-core expert store, where cold experts are moved to meta
+    after being written to disk.
     """
 
     def __init__(self, lambda_: float = 0.4):
@@ -32,16 +36,25 @@ class EWC:
 
     def penalty(self, model: torch.nn.Module) -> torch.Tensor:
         if not self.tasks or self.lambda_ <= 0:
-            return torch.zeros((), device=next(model.parameters()).device)
+            # If model has no parameters (shouldn't), just return 0.
+            try:
+                dev = next(model.parameters()).device
+            except StopIteration:
+                dev = torch.device("cpu")
+            return torch.zeros((), device=dev)
 
-        penalty = torch.zeros((), device=next(model.parameters()).device)
+        dev = next(model.parameters()).device
+        penalty = torch.zeros((), device=dev)
         named_params = dict(model.named_parameters())
 
         for task in self.tasks:
             for name, p_star in task.params_star.items():
-                if name not in named_params:
+                p = named_params.get(name)
+                if p is None:
                     continue
-                p = named_params[name]
+                if p.device.type == "meta":
+                    # Cold expert currently offloaded; it's not being trained, so we don't need a penalty.
+                    continue
                 f = task.fisher_diag.get(name)
                 if f is None:
                     continue
@@ -54,10 +67,16 @@ class EWC:
 
 
 @torch.no_grad()
-def _clone_params(named_params: Dict[str, torch.nn.Parameter], *, filter_fn: Optional[Callable[[str], bool]] = None) -> Dict[str, torch.Tensor]:
+def _clone_params(
+    named_params: Dict[str, torch.nn.Parameter],
+    *,
+    filter_fn: Optional[Callable[[str], bool]] = None,
+) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
     for n, p in named_params.items():
         if filter_fn is not None and not filter_fn(n):
+            continue
+        if p.device.type == "meta":
             continue
         out[n] = p.detach().cpu().clone()
     return out
@@ -73,13 +92,14 @@ def estimate_fisher_diag(
 ) -> Dict[str, torch.Tensor]:
     """Estimate diagonal Fisher as average squared gradients of `loss_fn`.
 
-    This is a pragmatic approximation used widely in EWC-style implementations.
+    Pragmatic approximation used widely in EWC implementations.
+
+    IMPORTANT: For this out-of-core scaffold, any parameter on 'meta' is skipped.
     """
     model.train()
 
-    # Initialize accumulators
     fisher: Dict[str, torch.Tensor] = {}
-    named_params = {n: p for n, p in model.named_parameters() if p.requires_grad}
+    named_params = {n: p for n, p in model.named_parameters() if p.requires_grad and p.device.type != "meta"}
     for n, p in named_params.items():
         if filter_fn is not None and not filter_fn(n):
             continue
@@ -120,7 +140,6 @@ def make_snapshot(
     filter_fn: Optional[Callable[[str], bool]] = None,
 ) -> EWCTaskSnapshot:
     params_star = _clone_params(dict(model.named_parameters()), filter_fn=filter_fn)
-    # Ensure fisher keys match filter
     if filter_fn is not None:
         fisher_diag = {k: v for k, v in fisher_diag.items() if filter_fn(k)}
     return EWCTaskSnapshot(name=name, params_star=params_star, fisher_diag=fisher_diag)

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import math
 import random
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -13,6 +13,7 @@ from config import Config
 from envs import make_atari_env
 from models import MoEDQN
 from replay import SleepBuffer, Transition
+from store.expert_store import ExpertStore, ExpertStoreStats
 from utils.device import get_default_device
 from utils.seed import set_global_seeds
 from .ewc import EWC, estimate_fisher_diag, make_snapshot
@@ -29,49 +30,8 @@ def linear_epsilon(step: int, start: float, end: float, decay_steps: int) -> flo
 class DayStats:
     episode_returns: List[float]
     steps: int
-    cache_hit_rate: float
     expert_scores: np.ndarray  # (num_experts,)
-
-
-class SimpleExpertCacheSimulator:
-    """A tiny cache simulator for tracking 'HBM resident' experts.
-
-    This does NOT move parameters. It just tracks reuse/hit-rate, which is useful
-    before implementing real HBM/DRAM/NVMe swapping.
-    """
-
-    def __init__(self, capacity_experts: int):
-        self.capacity = int(capacity_experts)
-        self.resident: List[int] = []
-        self.hits = 0
-        self.misses = 0
-
-    def prefetch(self, expert_ids: List[int]) -> None:
-        # Simple: replace the cache content with the prefetched experts (unique, truncated)
-        uniq = []
-        for e in expert_ids:
-            if e not in uniq:
-                uniq.append(int(e))
-        self.resident = uniq[: self.capacity]
-
-    def access(self, expert_ids: List[int]) -> None:
-        for e in expert_ids:
-            e = int(e)
-            if e in self.resident:
-                self.hits += 1
-            else:
-                self.misses += 1
-                # LRU-ish insert
-                self.resident.insert(0, e)
-                self.resident = self.resident[: self.capacity]
-
-    def hit_rate(self) -> float:
-        total = self.hits + self.misses
-        return float(self.hits) / float(total) if total > 0 else 0.0
-
-    def reset_counts(self) -> None:
-        self.hits = 0
-        self.misses = 0
+    store_stats: ExpertStoreStats
 
 
 class DayNightTrainer:
@@ -82,6 +42,7 @@ class DayNightTrainer:
         *,
         seed: int = 0,
         device: Optional[torch.device] = None,
+        run_dir: Optional[str | Path] = None,
     ):
         self.games = list(games)
         self.cfg = cfg
@@ -89,6 +50,7 @@ class DayNightTrainer:
         set_global_seeds(self.seed)
 
         self.device = device or get_default_device()
+        self.run_dir = Path(run_dir) if run_dir is not None else None
 
         # We'll assume Atari with unified full action space => Discrete(18)
         self.action_dim = 18
@@ -115,14 +77,56 @@ class DayNightTrainer:
         self.target_model.load_state_dict(self.model.state_dict())
         self.target_model.eval()
 
-        self.optim = torch.optim.Adam(self.model.parameters(), lr=self.cfg.learning_rate)
-        self.ewc = EWC(lambda_=self.cfg.ewc_lambda)
+        # Expert stores (online + target)
+        base = self.run_dir if self.run_dir is not None else Path("./runs/_tmp")
+        experts_dir_online = base / "experts" / "online"
+        experts_dir_target = base / "experts" / "target"
 
+        self.expert_store = ExpertStore(
+            experts=self.model.experts,
+            disk_dir=experts_dir_online,
+            hbm_capacity=self.cfg.hbm_expert_capacity,
+            dram_capacity=self.cfg.dram_expert_capacity,
+            device=self.device,
+            enable_disk=self.cfg.enable_nvme_tier,
+            pin_cpu=self.cfg.pin_cpu_memory,
+            create_expert_optimizer=True,
+            expert_lr=self.cfg.learning_rate,
+        )
+
+        self.target_store = ExpertStore(
+            experts=self.target_model.experts,
+            disk_dir=experts_dir_target,
+            hbm_capacity=self.cfg.hbm_expert_capacity,
+            dram_capacity=self.cfg.dram_expert_capacity,
+            device=self.device,
+            enable_disk=self.cfg.enable_nvme_tier,
+            pin_cpu=self.cfg.pin_cpu_memory,
+            create_expert_optimizer=False,
+        )
+
+        # Cold-start experts to disk to force real paging behavior
+        if self.cfg.enable_nvme_tier:
+            self.expert_store.cold_start_to_disk()
+            self.target_store.cold_start_to_disk()
+
+        # Core optimizer (router + encoder). Experts are optimized via per-expert optimizers.
+        core_params = list(self.model.encoder.parameters()) + list(self.model.router.parameters())
+        self.core_optim = torch.optim.Adam(core_params, lr=self.cfg.learning_rate)
+
+        self.ewc = EWC(lambda_=self.cfg.ewc_lambda)
         self.sleep_buffer = SleepBuffer()
         self.global_step = 0
 
         # Per-game routing statistics
         self.flagged_experts: Dict[str, List[int]] = {}
+
+        # Track which experts were updated since last target sync
+        self._dirty_experts: Set[int] = set()
+
+        # Optional checkpoint dir
+        if self.run_dir is not None:
+            (self.run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
     # ------------------------ acting (day) ------------------------
 
@@ -132,13 +136,7 @@ class DayNightTrainer:
             return random.randrange(self.action_dim)
         return int(torch.argmax(q, dim=-1).item())
 
-    @staticmethod
-    def _top_experts_from_gating(gating_probs: torch.Tensor, k: int = 2) -> List[int]:
-        # gating_probs: (E,)
-        vals, idx = torch.topk(gating_probs, k=min(k, gating_probs.shape[-1]))
-        return [int(i) for i in idx.tolist()]
-
-    def run_day_for_game(self, game_id: str, *, steps: int, cache_capacity: int = 4) -> DayStats:
+    def run_day_for_game(self, game_id: str, *, steps: int) -> DayStats:
         env = make_atari_env(
             game_id,
             seed=self.seed,
@@ -151,42 +149,45 @@ class DayNightTrainer:
         hidden = self.model.init_hidden(1, self.device)
 
         # Prefetch last known flagged experts for this game (if any)
-        cache = SimpleExpertCacheSimulator(capacity_experts=cache_capacity)
-        cache.prefetch(self.flagged_experts.get(game_id, []))
+        pref = self.flagged_experts.get(game_id, [])
+        if pref:
+            self.expert_store.prefetch_to_gpu(pref)
+            self.target_store.prefetch_to_gpu(pref)
+
+        self.expert_store.reset_stats()
 
         episode_return = 0.0
         episode_returns: List[float] = []
 
         expert_scores = np.zeros((self.cfg.num_experts,), dtype=np.float32)
 
-        for t in range(int(steps)):
+        for _ in range(int(steps)):
             eps = linear_epsilon(self.global_step, self.cfg.epsilon_start, self.cfg.epsilon_end, self.cfg.epsilon_decay_steps)
 
             obs_t = torch.from_numpy(obs).to(self.device)
             if obs_t.ndim == 3:
                 obs_t = obs_t.unsqueeze(0)  # (1, stack, 84, 84)
 
-            out = self.model(obs_t, hidden)
+            out = self.model(
+                obs_t,
+                hidden,
+                expert_store=self.expert_store,
+                top_k=self.cfg.expert_top_k,
+            )
             q = out.q_values  # (1, A)
             gating = out.gating_probs.squeeze(0)  # (E,)
-
-            # Access top-2 experts for cache stats
-            top2 = self._top_experts_from_gating(gating, k=2)
-            cache.access(top2)
 
             action = self._select_action(q.squeeze(0), eps)
 
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
 
-            # Salience estimate (cheap): TD-error proxy + action surprisal
-            # TD-error uses target network bootstrap.
+            # Salience estimate (cheap-ish): TD-error proxy + action surprisal
             td_err, surprisal = self._compute_salience_components(obs, action, reward, next_obs, done, hidden)
             salience = float(self.cfg.td_error_weight * td_err + self.cfg.policy_surprisal_weight * surprisal)
 
             # Update expert usage stats (responsibility * salience)
-            with torch.no_grad():
-                expert_scores += gating.detach().cpu().numpy() * salience
+            expert_scores += gating.detach().cpu().numpy() * salience
 
             # Store transition in day buffer
             self.sleep_buffer.add(
@@ -222,11 +223,12 @@ class DayNightTrainer:
         # End any partial episode
         self.sleep_buffer.end_episode(game_id)
 
+        store_stats = self.expert_store.reset_stats()
         return DayStats(
             episode_returns=episode_returns,
             steps=int(steps),
-            cache_hit_rate=cache.hit_rate(),
             expert_scores=expert_scores,
+            store_stats=store_stats,
         )
 
     @torch.no_grad()
@@ -246,7 +248,7 @@ class DayNightTrainer:
             obs_t = obs_t.unsqueeze(0)
             next_obs_t = next_obs_t.unsqueeze(0)
 
-        out = self.model(obs_t, hidden)
+        out = self.model(obs_t, hidden, expert_store=self.expert_store, top_k=self.cfg.expert_top_k)
         q = out.q_values  # (1, A)
 
         # Surprisal using softmax over Q-values (approx policy)
@@ -267,12 +269,18 @@ class DayNightTrainer:
 
     @torch.no_grad()
     def _target_q_next(self, next_obs_t: torch.Tensor, hidden_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        out_next = self.target_model(next_obs_t, hidden_t)
+        out_next = self.target_model(next_obs_t, hidden_t, expert_store=self.target_store, top_k=self.cfg.expert_top_k)
         return out_next.q_values, out_next.hidden
 
     # ------------------------ learning (sleep) ------------------------
 
-    def _loss_on_sequence_batch(self, model: MoEDQN, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _loss_on_sequence_batch(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        used_experts: Set[int],
+        include_ewc: bool = True,
+    ) -> torch.Tensor:
         """Compute DRQN-style DQN loss on a (B, T, ...) batch."""
         obs = batch["obs"]            # (B, T, C, H, W)
         actions = batch["actions"]    # (B, T)
@@ -283,20 +291,24 @@ class DayNightTrainer:
 
         B, T = actions.shape
 
-        hidden = model.init_hidden(B, obs.device)
-
+        hidden = self.model.init_hidden(B, obs.device)
         total_loss = torch.zeros((), device=obs.device)
 
         for t in range(T):
-            out = model(obs[:, t], hidden)
+            out = self.model(
+                obs[:, t],
+                hidden,
+                expert_store=self.expert_store,
+                top_k=self.cfg.expert_top_k,
+                record_used_experts=used_experts,
+            )
             q = out.q_values
             hidden = out.hidden
 
-            # Reset hidden where done (to avoid leaking context across episode boundaries)
+            # Reset hidden where done
             done_t = dones[:, t].view(B, 1)
             hidden = hidden * (1.0 - done_t)
 
-            # Q(s,a)
             a_t = actions[:, t].long().view(B, 1)
             q_sa = q.gather(1, a_t).squeeze(1)
 
@@ -305,22 +317,19 @@ class DayNightTrainer:
                 max_next = q_next.max(dim=-1).values
                 target = rewards[:, t] + (1.0 - dones[:, t]) * self.cfg.gamma * max_next
 
-            # Huber
             td = q_sa - target
             huber = torch.where(td.abs() < 1.0, 0.5 * td.pow(2), td.abs() - 0.5)
 
-            # Salience-weighted loss (acts like prioritization if sampling is imperfect)
             w = (salience[:, t].detach() + 1e-6) ** self.cfg.salience_alpha
             w = w / (w.mean() + 1e-6)
 
             total_loss = total_loss + (w * huber).mean()
 
-        # Add EWC penalty
-        total_loss = total_loss + self.ewc.penalty(model)
+        if include_ewc:
+            total_loss = total_loss + self.ewc.penalty(self.model)
         return total_loss
 
     def _iter_fisher_batches(self, game_id: str, *, max_batches: int) -> Iterator[Dict[str, torch.Tensor]]:
-        """Yield a few batches for Fisher estimation."""
         rng = np.random.default_rng(self.seed)
         for _ in range(max_batches):
             sample = self.sleep_buffer.sample_sequences(
@@ -334,14 +343,10 @@ class DayNightTrainer:
             yield self._to_torch_batch(sample)
 
     def _to_torch_batch(self, sample: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
-        # Observations from gymnasium are (stack, 84,84). In batch we want (B,T,stack,84,84)
         obs = torch.from_numpy(sample["obs"]).to(self.device)
         next_obs = torch.from_numpy(sample["next_obs"]).to(self.device)
 
-        # Ensure channel-first for conv encoder: (B,T,C,H,W)
-        if obs.ndim == 5:
-            pass
-        else:
+        if obs.ndim != 5:
             raise RuntimeError(f"Unexpected obs shape: {obs.shape}")
 
         return {
@@ -353,59 +358,10 @@ class DayNightTrainer:
             "salience": torch.from_numpy(sample["salience"]).to(self.device),
         }
 
-    def run_sleep(self, games_today: List[str]) -> Dict[str, float]:
-        """Run the sleep phase training on today's games only."""
-        metrics: Dict[str, float] = {}
-        updates = 0
-
-        # Simple block schedule: loop over games, do N updates each
-        for game_id in games_today:
-            if self.sleep_buffer.num_transitions(game_id) < self.cfg.seq_len:
-                continue
-
-            for _ in range(self.cfg.sleep_updates_per_game):
-                sample = self.sleep_buffer.sample_sequences(
-                    game_id,
-                    batch_size=self.cfg.batch_size,
-                    seq_len=self.cfg.seq_len,
-                    prioritize=True,
-                    alpha=self.cfg.salience_alpha,
-                )
-                batch = self._to_torch_batch(sample)
-
-                self.optim.zero_grad(set_to_none=True)
-                loss = self._loss_on_sequence_batch(self.model, batch)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
-                self.optim.step()
-
-                updates += 1
-
-                if updates % self.cfg.target_update_interval == 0:
-                    self.target_model.load_state_dict(self.model.state_dict())
-
-            # After training on this game in sleep, estimate fisher and snapshot for EWC.
-            fisher_filter = self._make_ewc_filter_fn(game_id)
-            fisher = estimate_fisher_diag(
-                self.model,
-                batches=self._iter_fisher_batches(game_id, max_batches=self.cfg.fisher_batches),
-                loss_fn=lambda m, b: self._loss_on_sequence_batch(m, b) - self.ewc.penalty(m),
-                filter_fn=fisher_filter,
-                max_batches=self.cfg.fisher_batches,
-            )
-            snapshot = make_snapshot(self.model, name=game_id, fisher_diag=fisher, filter_fn=fisher_filter)
-            self.ewc.add_task_snapshot(snapshot)
-
-            metrics[f"sleep_updates_{game_id}"] = float(self.cfg.sleep_updates_per_game)
-
-        metrics["sleep_total_updates"] = float(updates)
-        return metrics
-
     def _make_ewc_filter_fn(self, game_id: str):
         flagged = set(self.flagged_experts.get(game_id, []))
 
         def keep(name: str) -> bool:
-            # Always protect router
             if name.startswith("router."):
                 return True
             if self.cfg.protect_encoder and name.startswith("encoder."):
@@ -422,10 +378,145 @@ class DayNightTrainer:
 
         return keep
 
+    def _sync_target(self) -> None:
+        """Sync encoder/router always, and sync experts that were recently updated."""
+        # Core
+        self.target_model.encoder.load_state_dict(self.model.encoder.state_dict())
+        self.target_model.router.load_state_dict(self.model.router.state_dict())
+
+        # Experts: only sync those we actually updated.
+        if not self._dirty_experts:
+            return
+
+        for eid in sorted(self._dirty_experts):
+            # Ensure both online and target experts are materialized on CPU so state_dict/load are safe
+            self.expert_store.ensure_on_cpu([eid])
+            self.target_store.ensure_on_cpu([eid])
+
+            sd = {k: v.detach().cpu() for k, v in self.model.experts[eid].state_dict().items()}
+            self.target_model.experts[eid].load_state_dict(sd, strict=True)
+
+        self._dirty_experts.clear()
+
+    def run_sleep(self, games_today: List[str]) -> Dict[str, object]:
+        metrics: Dict[str, object] = {}
+        updates = 0
+
+        for game_id in games_today:
+            if self.sleep_buffer.num_transitions(game_id) < self.cfg.seq_len:
+                continue
+
+            # Prefetch previously flagged experts for this game
+            flagged = self.flagged_experts.get(game_id, [])
+            if flagged:
+                self.expert_store.prefetch_to_gpu(flagged)
+                self.target_store.prefetch_to_gpu(flagged)
+
+            self.expert_store.reset_stats()
+
+            losses: List[float] = []
+
+            for u in range(int(self.cfg.sleep_updates_per_game)):
+                sample = self.sleep_buffer.sample_sequences(
+                    game_id,
+                    batch_size=self.cfg.batch_size,
+                    seq_len=self.cfg.seq_len,
+                    prioritize=True,
+                    alpha=self.cfg.salience_alpha,
+                )
+                batch = self._to_torch_batch(sample)
+
+                used_experts: Set[int] = set()
+
+                self.core_optim.zero_grad(set_to_none=True)
+                # Best-effort zero for experts currently on GPU; more precise would require tracking.
+                self.expert_store.zero_grad(self.expert_store.experts_on_gpu())
+
+                loss = self._loss_on_sequence_batch(batch, used_experts=used_experts)
+                loss.backward()
+
+                # Clip grads
+                torch.nn.utils.clip_grad_norm_(list(self.model.encoder.parameters()) + list(self.model.router.parameters()), 10.0)
+                for eid in used_experts:
+                    torch.nn.utils.clip_grad_norm_(self.model.experts[eid].parameters(), 10.0)
+
+                self.core_optim.step()
+                self.expert_store.step(used_experts)
+
+                self._dirty_experts.update(used_experts)
+
+                updates += 1
+                losses.append(float(loss.detach().cpu().item()))
+
+                if updates % self.cfg.target_update_interval == 0:
+                    self._sync_target()
+
+            # Fisher + snapshot after finishing this game in sleep
+            fisher_filter = self._make_ewc_filter_fn(game_id)
+
+            if self.cfg.protect_experts and flagged:
+                # Ensure flagged experts are materialized on GPU before fisher init
+                self.expert_store.ensure_on_gpu(flagged)
+
+            fisher = estimate_fisher_diag(
+                self.model,
+                batches=self._iter_fisher_batches(game_id, max_batches=self.cfg.fisher_batches),
+                # Fisher should be estimated on the base learning objective (no EWC penalty).
+                loss_fn=lambda m, b: self._loss_on_sequence_batch(b, used_experts=set(), include_ewc=False),
+                filter_fn=fisher_filter,
+                max_batches=self.cfg.fisher_batches,
+            )
+            snapshot = make_snapshot(self.model, name=game_id, fisher_diag=fisher, filter_fn=fisher_filter)
+            self.ewc.add_task_snapshot(snapshot)
+
+            s = self.expert_store.reset_stats()
+            metrics[f"sleep/{game_id}/hbm_hit_rate"] = s.hit_rate()
+            metrics[f"sleep/{game_id}/stall_time_s"] = s.stall_time_s
+            metrics[f"sleep/{game_id}/nvme_reads"] = s.nvme_reads
+            metrics[f"sleep/{game_id}/nvme_writes"] = s.nvme_writes
+            metrics[f"sleep/{game_id}/mean_loss"] = float(np.mean(losses)) if losses else 0.0
+            metrics[f"sleep/{game_id}/updates"] = float(self.cfg.sleep_updates_per_game)
+
+        metrics["sleep_total_updates"] = float(updates)
+        return metrics
+
     # ------------------------ full cycle ------------------------
 
+    def save_checkpoint(self, tag: str) -> Optional[Path]:
+        if self.run_dir is None:
+            return None
+
+        # Persist any currently-loaded experts so Drive-backed run_dirs survive Colab restarts.
+        if self.cfg.enable_nvme_tier:
+            self.expert_store.flush_resident_to_disk()
+            self.target_store.flush_resident_to_disk()
+
+        ckpt_path = self.run_dir / "checkpoints" / f"ckpt_{tag}.pt"
+        payload = {
+            "global_step": int(self.global_step),
+            "flagged_experts": dict(self.flagged_experts),
+            "ewc_tasks": [
+                {
+                    "name": t.name,
+                    "params_star": t.params_star,
+                    "fisher_diag": t.fisher_diag,
+                }
+                for t in self.ewc.tasks
+            ],
+            "model_core": {
+                "encoder": self.model.encoder.state_dict(),
+                "router": self.model.router.state_dict(),
+            },
+            "target_core": {
+                "encoder": self.target_model.encoder.state_dict(),
+                "router": self.target_model.router.state_dict(),
+            },
+            "config": self.cfg.__dict__,
+        }
+        torch.save(payload, ckpt_path)
+        return ckpt_path
+
     def run_one_day(self, day_index: int) -> Dict[str, object]:
-        """Runs one day: pick K games, play them sequentially, then sleep train, then flush."""
         rng = random.Random(self.seed + day_index)
         games_today = rng.sample(self.games, k=min(self.cfg.games_per_day, len(self.games)))
 
@@ -441,16 +532,37 @@ class DayNightTrainer:
 
         sleep_metrics = self.run_sleep(games_today)
 
-        # Flush sleep buffer at end of sleep cycle (per your spec)
+        # Flush sleep buffer at end of sleep cycle
         self.sleep_buffer.flush()
 
         out: Dict[str, object] = {
-            "day": day_index,
+            "day": int(day_index),
             "games_today": games_today,
             "episode_returns": {g: day_summaries[g].episode_returns for g in games_today},
-            "cache_hit_rate": {g: day_summaries[g].cache_hit_rate for g in games_today},
+            "episode_return_last": {
+                g: (float(day_summaries[g].episode_returns[-1]) if day_summaries[g].episode_returns else 0.0)
+                for g in games_today
+            },
+            "episode_return_mean": {
+                g: (float(np.mean(day_summaries[g].episode_returns)) if day_summaries[g].episode_returns else 0.0)
+                for g in games_today
+            },
+            "n_episodes": {g: int(len(day_summaries[g].episode_returns)) for g in games_today},
+            "day_cache": {
+                g: {
+                    "hbm_hit_rate": day_summaries[g].store_stats.hit_rate(),
+                    "stall_time_s": day_summaries[g].store_stats.stall_time_s,
+                    "nvme_reads": day_summaries[g].store_stats.nvme_reads,
+                    "nvme_writes": day_summaries[g].store_stats.nvme_writes,
+                }
+                for g in games_today
+            },
             "flagged_experts": {g: self.flagged_experts[g] for g in games_today},
             "sleep": sleep_metrics,
             "ewc_tasks": len(self.ewc.tasks),
         }
+
+        # Save a lightweight checkpoint each day if run_dir is set
+        self.save_checkpoint(tag=f"day{day_index:03d}")
+
         return out

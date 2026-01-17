@@ -10,10 +10,17 @@ class Config:
     reward_clip: bool = True
 
     # MoE model
-    num_experts: int = 8
+    num_experts: int = 32
     router_hidden_dim: int = 128
     expert_hidden_dim: int = 256
     feature_dim: int = 512
+    expert_top_k: int = 2  # sparse top-k experts per step
+
+    # Expert Store (HBM/DRAM/NVMe)
+    hbm_expert_capacity: int = 4          # how many experts may be resident on GPU
+    dram_expert_capacity: int = 16        # how many experts may be resident on CPU before spilling to disk
+    enable_nvme_tier: bool = True         # if True, evicted CPU experts are written to disk and moved to meta
+    pin_cpu_memory: bool = True           # enables non_blocking H2D copies
 
     # DQN / training
     gamma: float = 0.99
@@ -30,9 +37,9 @@ class Config:
     target_update_interval: int = 1000
 
     # Day/Night schedule
-    games_per_day: int = 2
-    day_steps_per_game: int = 2000
-    sleep_updates_per_game: int = 200
+    games_per_day: int = 5
+    day_steps_per_game: int = 6000
+    sleep_updates_per_game: int = 500
 
     # Salience
     salience_alpha: float = 0.6  # sampling exponent
@@ -43,6 +50,9 @@ class Config:
     # EWC
     ewc_lambda: float = 0.4
     fisher_batches: int = 25
-    top_experts_per_game: int = 3
+    top_experts_per_game: int = 4
     protect_encoder: bool = False  # include encoder params in EWC
     protect_experts: bool = True   # include flagged experts in EWC
+
+    # Logging / viz
+    log_every_sleep_steps: int = 50
