@@ -206,7 +206,9 @@ class ExpertStore:
             raise FileNotFoundError(f"Expert {expert_id} not found on disk at {path}")
 
         t0 = time.perf_counter()
-        payload = torch.load(path, map_location="cpu", weights_only=True)
+        # NOTE: We avoid using newer torch.load(...) keyword args (e.g. weights_only)
+        # to stay compatible with the wide range of PyTorch versions seen in Colab.
+        payload = torch.load(path, map_location="cpu")
         dt = time.perf_counter() - t0
 
         try:
