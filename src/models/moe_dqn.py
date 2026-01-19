@@ -131,8 +131,29 @@ class MoEDQN(nn.Module):
         topk_vals, topk_idx = torch.topk(gating_probs, k=K, dim=-1)  # (B,K)
         uniq_experts = torch.unique(topk_idx).tolist()
 
-        # Page experts to GPU (HBM) as needed
-        expert_store.ensure_on_gpu(uniq_experts)
+        # IMPORTANT:
+        # In a real out-of-core configuration, the number of unique experts used
+        # in a batch (len(uniq_experts)) can easily exceed the HBM capacity.
+        #
+        # If we attempt to "ensure all" experts are on GPU at once, the store
+        # will necessarily evict some (LRU), and then we'd later try to execute
+        # an evicted (CPU) expert on CUDA activations -> device mismatch.
+        #
+        # To keep correctness regardless of cache capacity, we use a hybrid:
+        #   - If the working set fits in HBM, prefetch all at once.
+        #   - Otherwise, page experts just-in-time inside the per-expert loop.
+        #
+        # This is slower than an overlapped/pipelined scheme, but it is a
+        # correctness-first baseline that makes the paging behavior explicit.
+        try:
+            hbm_cap = int(getattr(expert_store, "hbm_capacity", 0))
+        except Exception:
+            hbm_cap = 0
+
+        prefetched_all = False
+        if hbm_cap > 0 and len(uniq_experts) <= hbm_cap:
+            expert_store.ensure_on_gpu(uniq_experts)
+            prefetched_all = True
 
         if record_used_experts is not None:
             for e in uniq_experts:
@@ -144,6 +165,12 @@ class MoEDQN(nn.Module):
         # Compute only used experts
         for e in uniq_experts:
             e = int(e)
+
+            # If we didn't prefetch the whole working set (e.g., too many unique
+            # experts for the HBM capacity), ensure this expert is resident now.
+            if not prefetched_all:
+                expert_store.ensure_on_gpu([e])
+
             mask = (topk_idx == e)  # (B,K)
             if not mask.any():
                 continue
