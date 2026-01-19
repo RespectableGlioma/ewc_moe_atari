@@ -66,6 +66,12 @@ def _move_optimizer_state_(optim: torch.optim.Optimizer, device: torch.device) -
                 state[k] = v.to(device)
 
 
+def _module_device(module: nn.Module) -> torch.device:
+    """Best-effort device of a module (first parameter device, else CPU)."""
+    p = next(module.parameters(), None)
+    return p.device if p is not None else torch.device("cpu")
+
+
 class ExpertStore:
     """A minimal "real" expert store that pages experts across GPU (HBM), CPU (DRAM), and disk (NVMe).
 
@@ -249,7 +255,15 @@ class ExpertStore:
     def _ensure_on_cpu(self, expert_id: int) -> None:
         expert_id = int(expert_id)
         if self._is_on_cpu(expert_id):
+            # Even if the module is already on CPU, make sure (a) the per-expert
+            # optimizer exists if requested and (b) its state tensors are on CPU.
+            if self.create_expert_optimizer:
+                if expert_id not in self._optims:
+                    self._optims[expert_id] = torch.optim.Adam(self.experts[expert_id].parameters(), lr=self.expert_lr)
+                _move_optimizer_state_(self._optims[expert_id], torch.device("cpu"))
+
             self._touch_lru(self._dram_lru, expert_id)
+            self._evict_dram_if_needed()
             return
 
         # If on disk/meta, load from disk. Otherwise move from GPU.
@@ -282,6 +296,14 @@ class ExpertStore:
     def _ensure_on_gpu(self, expert_id: int) -> None:
         expert_id = int(expert_id)
         if self._is_on_gpu(expert_id):
+            # IMPORTANT: parameters can end up on GPU while optimizer state is still
+            # on CPU (e.g., after a checkpoint restore, or accidental external `.to()` calls).
+            # Make this path robust by ensuring optimizer/state residency too.
+            if self.create_expert_optimizer:
+                if expert_id not in self._optims:
+                    self._optims[expert_id] = torch.optim.Adam(self.experts[expert_id].parameters(), lr=self.expert_lr)
+                _move_optimizer_state_(self._optims[expert_id], self.device)
+
             self._touch_lru(self._hbm_lru, expert_id)
             self.stats.hbm_hits += 1
             return
@@ -423,10 +445,16 @@ class ExpertStore:
                 opt.zero_grad(set_to_none=True)
 
     def step(self, expert_ids: Iterable[int]) -> None:
+        # Defensive: parameters may be moved across devices between updates.
+        # Before stepping, ensure the optimizer state tensors are on the same
+        # device as the expert parameters to avoid "cuda vs cpu" errors.
         for e in set(int(x) for x in expert_ids):
             opt = self._optims.get(e)
-            if opt is not None:
-                opt.step()
+            if opt is None:
+                continue
+            dev = _module_device(self.experts[e])
+            _move_optimizer_state_(opt, dev)
+            opt.step()
 
     def experts_on_gpu(self) -> List[int]:
         return list(self._hbm_lru)
