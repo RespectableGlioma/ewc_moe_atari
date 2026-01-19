@@ -454,14 +454,28 @@ class ExpertStore:
                 opt.zero_grad(set_to_none=True)
 
     def step(self, expert_ids: Iterable[int]) -> None:
-        # Defensive: parameters may be moved across devices between updates.
-        # Before stepping, ensure the optimizer state tensors are on the same
-        # device as the expert parameters to avoid "cuda vs cpu" errors.
+        # Defensive: experts may be moved across devices (GPU<->CPU) between the
+        # backward pass and the optimizer step (e.g., due to paging / eviction).
+        #
+        # PyTorch optimizers do NOT automatically move their state tensors, and
+        # module.to(device) does not reliably move parameter .grad tensors.
+        #
+        # To prevent "cuda vs cpu" errors inside Adam, we align BOTH:
+        #   (1) optimizer state tensors (exp_avg, exp_avg_sq, ...) and
+        #   (2) parameter gradients
+        # to the expert's current parameter device before calling opt.step().
         for e in set(int(x) for x in expert_ids):
             opt = self._optims.get(e)
             if opt is None:
                 continue
-            dev = _module_device(self.experts[e])
+            mod = self.experts[e]
+            dev = _module_device(mod)
+
+            # Ensure gradients are on the same device as parameters.
+            for p in mod.parameters():
+                if p.grad is not None and p.grad.device != dev:
+                    p.grad = p.grad.to(dev, non_blocking=True)
+
             _move_optimizer_state_(opt, dev)
             opt.step()
 
