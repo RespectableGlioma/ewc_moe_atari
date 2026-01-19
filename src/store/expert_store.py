@@ -144,7 +144,15 @@ class ExpertStore:
         p = next(e.parameters(), None)
         if p is None:
             return False
-        return p.device.type == self.device.type and p.device == self.device
+        if p.device.type != self.device.type:
+            return False
+
+        # torch.device('cuda') is not equal to torch.device('cuda:0'). If the store
+        # was initialized with an index-less CUDA device, treat any CUDA index as GPU-resident.
+        if self.device.type == "cuda" and self.device.index is None:
+            return True
+
+        return p.device == self.device
 
     def _is_on_cpu(self, expert_id: int) -> bool:
         e = self.experts[int(expert_id)]
@@ -321,7 +329,8 @@ class ExpertStore:
         e = e.to(self.device, non_blocking=True)
         # If we want true overlap we'd need streams; here we time the blocking move.
         if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+            # Synchronize the current CUDA device for timing stability.
+            torch.cuda.synchronize()
         dt = time.perf_counter() - t0
 
         self.stats.bytes_h2d += int(h2d)
