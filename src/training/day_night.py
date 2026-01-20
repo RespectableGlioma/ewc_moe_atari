@@ -428,28 +428,45 @@ class DayNightTrainer:
 
                 used_experts: Set[int] = set()
 
-                self.core_optim.zero_grad(set_to_none=True)
-                # Best-effort zero for experts currently on GPU; more precise would require tracking.
-                self.expert_store.zero_grad(self.expert_store.experts_on_gpu())
+                # IMPORTANT for out-of-core MoE training:
+                # Begin a "step scope" so the ExpertStore can pin any experts that become
+                # part of the autograd graph during this update. Evicting an expert to CPU
+                # mid-step will cause CUDA/CPU device-mismatch errors during backward().
+                if hasattr(self.expert_store, "begin_step"):
+                    self.expert_store.begin_step()
 
-                loss = self._loss_on_sequence_batch(batch, used_experts=used_experts)
-                loss.backward()
+                try:
+                    self.core_optim.zero_grad(set_to_none=True)
+                    # Best-effort zero for experts currently on GPU; more precise would require tracking.
+                    self.expert_store.zero_grad(self.expert_store.experts_on_gpu())
 
-                # Clip grads
-                torch.nn.utils.clip_grad_norm_(list(self.model.encoder.parameters()) + list(self.model.router.parameters()), 10.0)
-                for eid in used_experts:
-                    torch.nn.utils.clip_grad_norm_(self.model.experts[eid].parameters(), 10.0)
+                    loss = self._loss_on_sequence_batch(batch, used_experts=used_experts)
 
-                self.core_optim.step()
-                self.expert_store.step(used_experts)
+                    # Now that we know which experts participated in the forward pass, ensure their
+                    # per-expert optimizers have clean grads before backward (handles experts that
+                    # were offloaded between steps).
+                    self.expert_store.zero_grad(used_experts)
 
-                self._dirty_experts.update(used_experts)
+                    loss.backward()
 
-                updates += 1
-                losses.append(float(loss.detach().cpu().item()))
+                    # Clip grads
+                    torch.nn.utils.clip_grad_norm_(list(self.model.encoder.parameters()) + list(self.model.router.parameters()), 10.0)
+                    for eid in used_experts:
+                        torch.nn.utils.clip_grad_norm_(self.model.experts[eid].parameters(), 10.0)
 
-                if updates % self.cfg.target_update_interval == 0:
-                    self._sync_target()
+                    self.core_optim.step()
+                    self.expert_store.step(used_experts)
+
+                    self._dirty_experts.update(used_experts)
+
+                    updates += 1
+                    losses.append(float(loss.detach().cpu().item()))
+
+                    if updates % self.cfg.target_update_interval == 0:
+                        self._sync_target()
+                finally:
+                    if hasattr(self.expert_store, "end_step"):
+                        self.expert_store.end_step()
 
             # Fisher + snapshot after finishing this game in sleep
             fisher_filter = self._make_ewc_filter_fn(game_id)
