@@ -111,7 +111,10 @@ class ExpertStore:
         self._can_pin = bool(self.pin_cpu and self.device.type == "cuda" and torch.cuda.is_available())
         self.create_expert_optimizer = bool(create_expert_optimizer)
         self.expert_lr = float(expert_lr)
-        
+
+        # Step-scoped pinning to prevent evicting experts that are still part of
+        # a live autograd graph (which would otherwise create CPU/CUDA mismatches
+        # during backward()).
         self._pin_active: bool = False
         self._pinned_hbm: Set[int] = set()
 
@@ -272,7 +275,9 @@ class ExpertStore:
         """Call after optimizer steps; now it's safe to evict again."""
         self._pin_active = False
         self._pinned_hbm.clear()
-        self._evict_hbm_if_needed(protect=set())  # enforce budget
+        # Enforce budget now that no autograd graph depends on these experts.
+        self._evict_hbm_if_needed(protect=set())
+
 
     def _ensure_on_cpu(self, expert_id: int) -> None:
         expert_id = int(expert_id)
@@ -327,10 +332,10 @@ class ExpertStore:
                 _move_optimizer_state_(self._optims[expert_id], self.device)
 
             self._touch_lru(self._hbm_lru, expert_id)
-            
+
             if self._pin_active:
                 self._pinned_hbm.add(expert_id)
-            
+
             self.stats.hbm_hits += 1
             return
 
@@ -365,19 +370,19 @@ class ExpertStore:
             _move_optimizer_state_(self._optims[expert_id], self.device)
 
         self._touch_lru(self._hbm_lru, expert_id)
-        
+
         if self._pin_active:
             self._pinned_hbm.add(expert_id)
-        
+
         self._evict_hbm_if_needed(protect=set([expert_id]))
 
     def _evict_hbm_if_needed(self, protect: Optional[Set[int]] = None) -> None:
         protect = protect or set()
 
-        # Always protect pinned experts during an active step.
+        # During an active training step, never evict experts that have been pinned
+        # (i.e., are part of the current autograd graph).
         if self._pin_active and self._pinned_hbm:
             protect |= set(self._pinned_hbm)
-
         while len(self._hbm_lru) > self.hbm_capacity:
             # Evict least recently used that is not protected.
             evict_id = None
@@ -385,9 +390,12 @@ class ExpertStore:
                 if cand not in protect:
                     evict_id = cand
                     break
-            
             if evict_id is None:
-                # If everything is protected, evict the absolute LRU.
+                # If everything is protected/pinned, we cannot evict without breaking
+                # a live autograd graph. Defer eviction until end_step().
+                if self._pin_active:
+                    break
+                # Otherwise (no active step), fall back to evicting the absolute LRU.
                 evict_id = self._hbm_lru[-1]
 
             self._hbm_lru.remove(evict_id)
