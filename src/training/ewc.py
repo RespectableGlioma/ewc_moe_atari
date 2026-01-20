@@ -82,6 +82,7 @@ def _clone_params(
     return out
 
 
+
 def estimate_fisher_diag(
     model: torch.nn.Module,
     batches: Iterable[Dict[str, torch.Tensor]],
@@ -96,18 +97,19 @@ def estimate_fisher_diag(
 
     Pragmatic approximation used widely in EWC implementations.
 
-    IMPORTANT: For this out-of-core scaffold, any parameter on 'meta' is skipped.
+    Out-of-core details:
+      - Parameters may migrate across devices (CPU<->GPU) due to paging.
+      - We accumulate Fisher on CPU, and always move grads to CPU before accumulating.
+      - If begin_step_fn/end_step_fn are provided (ExpertStore pin scopes), end_step_fn
+        is called AFTER gradients are read/accumulated to avoid moving parameters
+        (and leaving grads behind) before we read them.
+      - Parameters currently on the 'meta' device are skipped.
     """
     model.train()
 
     fisher: Dict[str, torch.Tensor] = {}
-    named_params = {n: p for n, p in model.named_parameters() if p.requires_grad and p.device.type != "meta"}
-    for n, p in named_params.items():
-        if filter_fn is not None and not filter_fn(n):
-            continue
-        fisher[n] = torch.zeros_like(p, device=p.device)
-
     n_batches = 0
+
     for batch in batches:
         if max_batches is not None and n_batches >= max_batches:
             break
@@ -118,27 +120,43 @@ def estimate_fisher_diag(
             model.zero_grad(set_to_none=True)
             loss = loss_fn(model, batch)
             loss.backward()
+
+            # Accumulate squared grads. Always accumulate on CPU so we don't care
+            # where parameters (or grads) live.
+            for n, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if p.device.type == "meta":
+                    continue
+                if filter_fn is not None and not filter_fn(n):
+                    continue
+                if p.grad is None:
+                    continue
+
+                g = p.grad.detach()
+                if g.is_sparse:
+                    g = g.to_dense()
+                g2_cpu = g.float().cpu().pow(2)
+
+                if n not in fisher:
+                    fisher[n] = torch.zeros_like(g2_cpu, device="cpu")
+                fisher[n] += g2_cpu
+
         finally:
+            # IMPORTANT: end_step_fn may evict experts / move parameters. Do it only
+            # after we've read grads into CPU buffers.
             if end_step_fn is not None:
                 end_step_fn()
-
-        for n, p in named_params.items():
-            if n not in fisher:
-                continue
-            if p.grad is None:
-                continue
-            fisher[n] += p.grad.detach().pow(2)
 
         n_batches += 1
 
     if n_batches == 0:
         return {k: v.detach().cpu() for k, v in fisher.items()}
 
-    for k in fisher:
+    for k in list(fisher.keys()):
         fisher[k] = (fisher[k] / float(n_batches)).detach().cpu()
 
     return fisher
-
 
 def make_snapshot(
     model: torch.nn.Module,
