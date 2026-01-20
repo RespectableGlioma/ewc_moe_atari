@@ -112,9 +112,7 @@ class ExpertStore:
         self.create_expert_optimizer = bool(create_expert_optimizer)
         self.expert_lr = float(expert_lr)
 
-        # Step-scoped pinning to prevent evicting experts that are still part of
-        # a live autograd graph (which would otherwise create CPU/CUDA mismatches
-        # during backward()).
+        # Step-scoped pinning: prevent eviction of experts participating in the current autograd graph.
         self._pin_active: bool = False
         self._pinned_hbm: Set[int] = set()
 
@@ -275,7 +273,7 @@ class ExpertStore:
         """Call after optimizer steps; now it's safe to evict again."""
         self._pin_active = False
         self._pinned_hbm.clear()
-        # Enforce budget now that no autograd graph depends on these experts.
+        # Enforce budget after the step (evictions are safe now).
         self._evict_hbm_if_needed(protect=set())
 
 
@@ -332,10 +330,8 @@ class ExpertStore:
                 _move_optimizer_state_(self._optims[expert_id], self.device)
 
             self._touch_lru(self._hbm_lru, expert_id)
-
             if self._pin_active:
                 self._pinned_hbm.add(expert_id)
-
             self.stats.hbm_hits += 1
             return
 
@@ -370,19 +366,18 @@ class ExpertStore:
             _move_optimizer_state_(self._optims[expert_id], self.device)
 
         self._touch_lru(self._hbm_lru, expert_id)
-
         if self._pin_active:
             self._pinned_hbm.add(expert_id)
-
         self._evict_hbm_if_needed(protect=set([expert_id]))
+
 
     def _evict_hbm_if_needed(self, protect: Optional[Set[int]] = None) -> None:
         protect = protect or set()
 
-        # During an active training step, never evict experts that have been pinned
-        # (i.e., are part of the current autograd graph).
+        # Always protect pinned experts during an active autograd step.
         if self._pin_active and self._pinned_hbm:
             protect |= set(self._pinned_hbm)
+
         while len(self._hbm_lru) > self.hbm_capacity:
             # Evict least recently used that is not protected.
             evict_id = None
@@ -390,18 +385,20 @@ class ExpertStore:
                 if cand not in protect:
                     evict_id = cand
                     break
+
             if evict_id is None:
-                # If everything is protected/pinned, we cannot evict without breaking
-                # a live autograd graph. Defer eviction until end_step().
+                # Everything currently resident is protected.
+                # If we're inside an active step, it's unsafe to evict (would break autograd).
                 if self._pin_active:
                     break
-                # Otherwise (no active step), fall back to evicting the absolute LRU.
+                # Outside a step, evict absolute LRU.
                 evict_id = self._hbm_lru[-1]
 
             self._hbm_lru.remove(evict_id)
             self.stats.hbm_evictions += 1
             # Move to CPU (DRAM)
             self._ensure_on_cpu(evict_id)
+
 
     def _evict_dram_if_needed(self) -> None:
         if not self.enable_disk:
@@ -520,6 +517,105 @@ class ExpertStore:
 
     def experts_on_cpu(self) -> List[int]:
         return list(self._dram_lru)
+
+    def save_experts_to_disk(self, expert_ids: Iterable[int]) -> None:
+        """Persist selected experts to disk (weights + optimizer state if enabled)."""
+        if not self.enable_disk:
+            return
+        ids = sorted(set(int(x) for x in expert_ids))
+        for eid in ids:
+            # Ensure weights are on CPU for portable saving.
+            self._ensure_on_cpu(eid)
+            self._save_to_disk(eid)
+
+    def reset_after_night(
+        self,
+        *,
+        retain_cpu_ids: Sequence[int],
+        writeback_ids: Optional[Iterable[int]] = None,
+        clear_hbm: bool = True,
+    ) -> None:
+        """
+        End-of-night behavior:
+          - Optionally write back dirty experts to disk
+          - Keep `retain_cpu_ids` resident on CPU (DRAM)
+          - Drop everything else currently resident (HBM/DRAM) to meta to free memory
+          - Optionally clear the HBM tier
+
+        IMPORTANT: This requires `enable_disk=True`. If disk is disabled, we do nothing
+        (dropping to meta would lose weights).
+        """
+        if not self.enable_disk:
+            return
+
+        # Ensure we're not in a pinned region.
+        self._pin_active = False
+        self._pinned_hbm.clear()
+
+        # Unique, stable order.
+        retain_list: List[int] = []
+        seen: Set[int] = set()
+        for x in retain_cpu_ids:
+            eid = int(x)
+            if eid not in seen:
+                seen.add(eid)
+                retain_list.append(eid)
+        retain_set = set(retain_list)
+
+        # Ensure retained experts are materialized on CPU (and counted as DRAM-resident).
+        if retain_list:
+            self.ensure_on_cpu(retain_list)
+
+        # Write back dirty experts (best-effort).
+        if writeback_ids is not None:
+            self.save_experts_to_disk(writeback_ids)
+
+        # Collect resident experts (HBM + DRAM).
+        resident_hbm = list(self._hbm_lru)
+        resident_dram = list(self._dram_lru)
+        resident = set(resident_hbm + resident_dram)
+
+        # Drop non-retained experts to meta to free memory.
+        for eid in sorted(resident):
+            if eid in retain_set:
+                continue
+            # If on GPU, move to CPU first (then to meta), so we don't keep CUDA allocations around.
+            if self._is_on_gpu(eid):
+                e = self.experts[eid]
+                self._remove_lru(self._hbm_lru, eid)
+                d2h = sum(int(p.numel() * p.element_size()) for p in e.parameters())
+                t0 = time.perf_counter()
+                e = e.to("cpu")
+                dt = time.perf_counter() - t0
+                self.stats.bytes_d2h += int(d2h)
+                self.stats.stall_time_s += float(dt)
+                if self._can_pin:
+                    for p in e.parameters():
+                        if p.device.type == "cpu":
+                            p.data = p.data.pin_memory()
+                if self.create_expert_optimizer and eid in self._optims:
+                    _move_optimizer_state_(self._optims[eid], torch.device("cpu"))
+
+            # Remove from DRAM LRU if present.
+            self._remove_lru(self._dram_lru, eid)
+
+            # Drop optimizer state for this expert.
+            if eid in self._optims:
+                del self._optims[eid]
+
+            # Finally move to meta.
+            self.experts[eid].to("meta")
+
+        # Clear HBM tier if requested (retained experts should already be on CPU).
+        if clear_hbm:
+            self._hbm_lru.clear()
+
+        # Rebuild DRAM LRU to contain only retained experts (MRU order as retain_list).
+        self._dram_lru = [eid for eid in retain_list if eid in retain_set]
+
+        # Enforce DRAM capacity if caller provided an oversized list.
+        self._evict_dram_if_needed()
+
 
     def flush_resident_to_disk(self) -> None:
         """Best-effort: persist all currently materialized experts to disk.

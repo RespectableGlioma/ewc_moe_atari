@@ -124,6 +124,28 @@ class DayNightTrainer:
         # Track which experts were updated since last target sync
         self._dirty_experts: Set[int] = set()
 
+        # Track which experts were updated since the start of the current night (for NVMe writeback).
+        self._dirty_since_night: Set[int] = set()
+
+        # A tiny generic 'base' expert set that we keep warm across all days.
+        # This helps the agent act immediately even before it pages in task-specific experts.
+        base_n = int(getattr(self.cfg, 'base_warm_experts', 2))
+        base_n = max(0, min(base_n, int(self.cfg.num_experts)))
+        # Keep base set small enough to comfortably fit in HBM when prefetched.
+        base_n = min(base_n, int(self.cfg.hbm_expert_capacity))
+        self.base_experts: List[int] = list(range(base_n))
+
+        # Warm DRAM set retained across days (initialized to base set).
+        self.warm_experts: List[int] = list(self.base_experts)
+
+        # Decayed retention scores (router-derived usage) used to pick the warm set each night.
+        self._retain_scores = np.zeros((self.cfg.num_experts,), dtype=np.float32)
+
+        # Ensure base experts are materialized on CPU so the first day can act immediately.
+        if self.cfg.enable_nvme_tier and self.base_experts:
+            self.expert_store.ensure_on_cpu(self.base_experts)
+            self.target_store.ensure_on_cpu(self.base_experts)
+
         # Optional checkpoint dir
         if self.run_dir is not None:
             (self.run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -425,51 +447,39 @@ class DayNightTrainer:
                     alpha=self.cfg.salience_alpha,
                 )
                 batch = self._to_torch_batch(sample)
-
                 used_experts: Set[int] = set()
 
-                # Begin a "step scope" so the ExpertStore can pin any experts that become
-                # part of the autograd graph for this update. This prevents paging an
-                # expert back to CPU mid-step (which otherwise triggers CUDA/CPU device
-                # mismatch errors during backward()).
-                if hasattr(self.expert_store, "begin_step"):
-                    self.expert_store.begin_step()
+                # Pin experts used in this step so they can't be evicted mid-backward.
+                self.expert_store.begin_step()
                 try:
                     self.core_optim.zero_grad(set_to_none=True)
-
-                    # Best-effort: clear grads for currently-resident experts. We'll also
-                    # explicitly clear grads for the experts actually used in this forward
-                    # once we know them.
+                    # Best-effort zero for experts currently on GPU; more precise would require tracking.
                     self.expert_store.zero_grad(self.expert_store.experts_on_gpu())
 
                     loss = self._loss_on_sequence_batch(batch, used_experts=used_experts)
-
-                    # Now that we know which experts participated in the forward pass,
-                    # clear their per-expert optimizer grads before backward.
-                    self.expert_store.zero_grad(used_experts)
-
                     loss.backward()
 
                     # Clip grads
-                    torch.nn.utils.clip_grad_norm_(
-                        list(self.model.encoder.parameters()) + list(self.model.router.parameters()), 10.0
-                    )
+                    torch.nn.utils.clip_grad_norm_(list(self.model.encoder.parameters()) + list(self.model.router.parameters()), 10.0)
                     for eid in used_experts:
                         torch.nn.utils.clip_grad_norm_(self.model.experts[eid].parameters(), 10.0)
 
                     self.core_optim.step()
                     self.expert_store.step(used_experts)
 
-                    self._dirty_experts.update(used_experts)
-
-                    updates += 1
-                    losses.append(float(loss.detach().cpu().item()))
                 finally:
-                    if hasattr(self.expert_store, "end_step"):
-                        self.expert_store.end_step()
+                    # After opt steps, eviction is safe again.
+                    self.expert_store.end_step()
+
+                self._dirty_experts.update(used_experts)
+                self._dirty_since_night.update(used_experts)
+
+                updates += 1
+                losses.append(float(loss.detach().cpu().item()))
 
                 if updates % self.cfg.target_update_interval == 0:
                     self._sync_target()
+
             # Fisher + snapshot after finishing this game in sleep
             fisher_filter = self._make_ewc_filter_fn(game_id)
 
@@ -484,6 +494,8 @@ class DayNightTrainer:
                 loss_fn=lambda m, b: self._loss_on_sequence_batch(b, used_experts=set(), include_ewc=False),
                 filter_fn=fisher_filter,
                 max_batches=self.cfg.fisher_batches,
+                begin_step_fn=self.expert_store.begin_step,
+                end_step_fn=self.expert_store.end_step,
             )
             snapshot = make_snapshot(self.model, name=game_id, fisher_diag=fisher, filter_fn=fisher_filter)
             self.ewc.add_task_snapshot(snapshot)
@@ -535,9 +547,76 @@ class DayNightTrainer:
         torch.save(payload, ckpt_path)
         return ckpt_path
 
+    def _select_warm_set(self, games_today: List[str], day_summaries: Dict[str, DayStats]) -> List[int]:
+        """Select a DRAM-resident warm set to keep across the day boundary.
+
+        Heuristic (router-driven):
+          - Start with base experts (always kept)
+          - Add experts that were saliently used today (from per-game expert_scores)
+          - Add flagged experts for the games played today
+          - Add the previous warm set (recency bias)
+
+        Then keep the top `dram_expert_capacity` by an exponential moving average of scores.
+        """
+        cap = int(self.cfg.dram_expert_capacity)
+        if cap <= 0:
+            return []
+
+        base = list(self.base_experts)
+        base_set = set(base)
+
+        # Aggregate today's expert usage scores across games.
+        today_scores = np.zeros((self.cfg.num_experts,), dtype=np.float32)
+        for g in games_today:
+            ds = day_summaries.get(g)
+            if ds is None:
+                continue
+            today_scores += ds.expert_scores
+
+        # Exponential moving average to carry some memory across days.
+        decay = float(getattr(self.cfg, 'warm_retain_decay', 0.9))
+        decay = max(0.0, min(decay, 0.999))
+        self._retain_scores = decay * self._retain_scores + today_scores
+
+        # Candidate pool: base + (today's per-game flagged) + previous warm set.
+        cand: Set[int] = set(base_set)
+        for g in games_today:
+            cand.update(int(x) for x in self.flagged_experts.get(g, []))
+        cand.update(int(x) for x in self.warm_experts)
+
+        # Always include base experts first.
+        keep: List[int] = list(base)
+
+        # Fill remaining slots by highest retention score.
+        remaining = cap - len(keep)
+        if remaining <= 0:
+            return keep[:cap]
+
+        others = [eid for eid in cand if eid not in base_set]
+        others.sort(key=lambda eid: float(self._retain_scores[int(eid)]), reverse=True)
+        keep.extend(int(eid) for eid in others[:remaining])
+
+        # De-dup while preserving order.
+        out: List[int] = []
+        seen: Set[int] = set()
+        for eid in keep:
+            eid = int(eid)
+            if eid in seen:
+                continue
+            seen.add(eid)
+            out.append(eid)
+            if len(out) >= cap:
+                break
+        return out
+
     def run_one_day(self, day_index: int) -> Dict[str, object]:
         rng = random.Random(self.seed + day_index)
         games_today = rng.sample(self.games, k=min(self.cfg.games_per_day, len(self.games)))
+
+        # Start-of-day: prefetch a tiny base set so we can act immediately.
+        if self.base_experts:
+            self.expert_store.prefetch_to_gpu(self.base_experts)
+            self.target_store.prefetch_to_gpu(self.base_experts)
 
         day_summaries: Dict[str, DayStats] = {}
         for g in games_today:
@@ -553,6 +632,28 @@ class DayNightTrainer:
 
         # Flush sleep buffer at end of sleep cycle
         self.sleep_buffer.flush()
+
+
+        # End-of-night: persist dirty experts, keep a DRAM warm set across days, and drop everything else to NVMe/meta.
+        warm_next: List[int] = list(self.warm_experts)
+        if self.cfg.enable_nvme_tier:
+            # Make sure the target network is synced for any remaining dirty experts before persisting.
+            self._sync_target()
+
+            dirty = set(int(x) for x in self._dirty_since_night)
+            if dirty:
+                self.expert_store.save_experts_to_disk(dirty)
+                self.target_store.save_experts_to_disk(dirty)
+
+            warm_next = self._select_warm_set(games_today, day_summaries)
+            self.warm_experts = list(warm_next)
+
+            # Keep warm set in DRAM, clear HBM, and drop everything else to meta.
+            self.expert_store.reset_after_night(retain_cpu_ids=warm_next, writeback_ids=None, clear_hbm=True)
+            self.target_store.reset_after_night(retain_cpu_ids=warm_next, writeback_ids=None, clear_hbm=True)
+
+            # New night starts next day.
+            self._dirty_since_night.clear()
 
         out: Dict[str, object] = {
             "day": int(day_index),
@@ -579,6 +680,7 @@ class DayNightTrainer:
             "flagged_experts": {g: self.flagged_experts[g] for g in games_today},
             "sleep": sleep_metrics,
             "ewc_tasks": len(self.ewc.tasks),
+            "warm_dram_experts": list(self.warm_experts),
         }
 
         # Save a lightweight checkpoint each day if run_dir is set

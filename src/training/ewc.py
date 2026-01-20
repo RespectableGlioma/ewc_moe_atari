@@ -89,6 +89,8 @@ def estimate_fisher_diag(
     *,
     filter_fn: Optional[Callable[[str], bool]] = None,
     max_batches: Optional[int] = None,
+    begin_step_fn: Optional[Callable[[], None]] = None,
+    end_step_fn: Optional[Callable[[], None]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Estimate diagonal Fisher as average squared gradients of `loss_fn`.
 
@@ -110,9 +112,15 @@ def estimate_fisher_diag(
         if max_batches is not None and n_batches >= max_batches:
             break
 
-        model.zero_grad(set_to_none=True)
-        loss = loss_fn(model, batch)
-        loss.backward()
+        if begin_step_fn is not None:
+            begin_step_fn()
+        try:
+            model.zero_grad(set_to_none=True)
+            loss = loss_fn(model, batch)
+            loss.backward()
+        finally:
+            if end_step_fn is not None:
+                end_step_fn()
 
         for n, p in named_params.items():
             if n not in fisher:
