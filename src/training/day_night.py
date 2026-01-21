@@ -373,6 +373,18 @@ class DayNightTrainer:
 
             total_loss = total_loss + (w * huber).mean()
 
+
+        # Router auxiliary regularizers (optional).
+        # - Entropy bonus: encourages per-step gating distributions to stay high-entropy (less collapse).
+        # - Load-balance KL: encourages the *average* gating distribution to be closer to uniform.
+        #
+        # Both are crude but effective first-order anti-collapse terms for research scaffolds.
+        if include_moe_aux and aux_n > 0:
+            if entropy_coef > 0.0:
+                total_loss = total_loss - entropy_coef * (aux_entropy / float(aux_n))
+            if balance_coef > 0.0:
+                total_loss = total_loss + balance_coef * (aux_kl / float(aux_n))
+
         if include_ewc:
             total_loss = total_loss + self.ewc.penalty(self.model)
         return total_loss

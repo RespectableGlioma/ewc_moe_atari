@@ -191,6 +191,21 @@ class ExpertStore:
         expert_id = int(expert_id)
         e = self.experts[expert_id]
         path = self.expert_path(expert_id)
+        # Meta device means "no storage" (only shapes). You cannot serialize parameters from
+        # a meta expert because there is literally no data to write. This can happen if
+        # bookkeeping is stale (an expert ID is still in an LRU list after being dropped),
+        # or if an expert was intentionally offloaded to meta earlier.
+        #
+        # If a disk copy already exists, skipping is safe: the meta expert cannot contain
+        # any newer weights than what's on disk.
+        if self._is_on_meta(expert_id):
+            if path.exists():
+                return
+            raise RuntimeError(
+                f"Cannot save expert {expert_id}: expert is on meta device and no disk copy exists at {path}. "
+                "This indicates a paging/bookkeeping bug (attempted to persist an expert with no materialized weights)."
+            )
+
 
         payload: Dict = {"state_dict": _state_dict_to_cpu(e.state_dict())}
 
@@ -577,9 +592,25 @@ class ExpertStore:
         """Best-effort: persist all currently materialized experts to disk.
 
         Useful in Colab so you don't lose expert weights/optim state if the runtime dies.
+
+        Safety:
+        - Never attempt to save an expert that is currently on the meta device (no storage).
+        - If an expert ended up meta but is still listed as resident, prune it from the LRU lists.
         """
         if not self.enable_disk:
             return
+
         ids = set(self._hbm_lru + self._dram_lru)
+
+        pruned_meta = 0
         for eid in sorted(ids):
+            if self._is_on_meta(eid):
+                # Stale bookkeeping: meta experts should not be counted as "resident".
+                self._remove_lru(self._hbm_lru, eid)
+                self._remove_lru(self._dram_lru, eid)
+                pruned_meta += 1
+                continue
             self._save_to_disk(eid)
+
+        if pruned_meta > 0:
+            print(f"[ExpertStore] NOTE: pruned {pruned_meta} stale meta experts from resident LRU during flush.")
