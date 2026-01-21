@@ -26,12 +26,27 @@ def linear_epsilon(step: int, start: float, end: float, decay_steps: int) -> flo
     return float(start + t * (end - start))
 
 
+def _add_store_stats(a: Optional[ExpertStoreStats], b: Optional[ExpertStoreStats]) -> ExpertStoreStats:
+    """Fieldwise sum of two ExpertStoreStats (None treated as zeros)."""
+    if a is None and b is None:
+        return ExpertStoreStats()
+    if a is None:
+        return b  # type: ignore[return-value]
+    if b is None:
+        return a
+    out = ExpertStoreStats()
+    for name in out.__dataclass_fields__.keys():
+        setattr(out, name, getattr(a, name) + getattr(b, name))
+    return out
+
+
 @dataclass
 class DayStats:
     episode_returns: List[float]
     steps: int
     expert_scores: np.ndarray  # (num_experts,)
     store_stats: ExpertStoreStats
+    boundary_store_stats: Optional[ExpertStoreStats] = None
 
 
 class DayNightTrainer:
@@ -178,12 +193,16 @@ class DayNightTrainer:
 
         self.expert_store.reset_stats()
 
+        boundary_steps = int(getattr(self.cfg, 'boundary_steps', 200))
+        boundary_steps = max(0, min(boundary_steps, int(steps)))
+        boundary_stats: Optional[ExpertStoreStats] = None
+
         episode_return = 0.0
         episode_returns: List[float] = []
 
         expert_scores = np.zeros((self.cfg.num_experts,), dtype=np.float32)
 
-        for _ in range(int(steps)):
+        for step_i in range(int(steps)):
             eps = linear_epsilon(self.global_step, self.cfg.epsilon_start, self.cfg.epsilon_end, self.cfg.epsilon_decay_steps)
 
             obs_t = torch.from_numpy(obs).to(self.device)
@@ -238,6 +257,9 @@ class DayNightTrainer:
             else:
                 obs = next_obs
 
+            if boundary_steps > 0 and (step_i + 1) == boundary_steps:
+                boundary_stats = self.expert_store.reset_stats()
+
             self.global_step += 1
 
         env.close()
@@ -245,12 +267,14 @@ class DayNightTrainer:
         # End any partial episode
         self.sleep_buffer.end_episode(game_id)
 
-        store_stats = self.expert_store.reset_stats()
+        rest_stats = self.expert_store.reset_stats()
+        store_stats = _add_store_stats(boundary_stats, rest_stats) if boundary_stats is not None else rest_stats
         return DayStats(
             episode_returns=episode_returns,
             steps=int(steps),
             expert_scores=expert_scores,
             store_stats=store_stats,
+            boundary_store_stats=boundary_stats,
         )
 
     @torch.no_grad()
@@ -437,6 +461,7 @@ class DayNightTrainer:
             self.expert_store.reset_stats()
 
             losses: List[float] = []
+            unique_counts: List[int] = []
 
             for u in range(int(self.cfg.sleep_updates_per_game)):
                 sample = self.sleep_buffer.sample_sequences(
@@ -473,6 +498,7 @@ class DayNightTrainer:
 
                 self._dirty_experts.update(used_experts)
                 self._dirty_since_night.update(used_experts)
+                unique_counts.append(int(len(used_experts)))
 
                 updates += 1
                 losses.append(float(loss.detach().cpu().item()))
@@ -502,11 +528,20 @@ class DayNightTrainer:
 
             s = self.expert_store.reset_stats()
             metrics[f"sleep/{game_id}/hbm_hit_rate"] = s.hit_rate()
+            metrics[f"sleep/{game_id}/miss_rate"] = s.miss_rate() if hasattr(s, 'miss_rate') else (1.0 - s.hit_rate())
             metrics[f"sleep/{game_id}/stall_time_s"] = s.stall_time_s
             metrics[f"sleep/{game_id}/nvme_reads"] = s.nvme_reads
             metrics[f"sleep/{game_id}/nvme_writes"] = s.nvme_writes
+            metrics[f"sleep/{game_id}/bytes_nvme_read"] = s.bytes_nvme_read
+            metrics[f"sleep/{game_id}/bytes_nvme_write"] = s.bytes_nvme_write
+            metrics[f"sleep/{game_id}/bytes_h2d"] = s.bytes_h2d
+            metrics[f"sleep/{game_id}/bytes_d2h"] = s.bytes_d2h
             metrics[f"sleep/{game_id}/mean_loss"] = float(np.mean(losses)) if losses else 0.0
             metrics[f"sleep/{game_id}/updates"] = float(self.cfg.sleep_updates_per_game)
+            if unique_counts:
+                metrics[f"sleep/{game_id}/unique_experts_mean"] = float(np.mean(unique_counts))
+                metrics[f"sleep/{game_id}/unique_experts_p95"] = float(np.percentile(unique_counts, 95))
+                metrics[f"sleep/{game_id}/unique_experts_max"] = float(np.max(unique_counts))
 
         metrics["sleep_total_updates"] = float(updates)
         return metrics
@@ -612,6 +647,8 @@ class DayNightTrainer:
     def run_one_day(self, day_index: int) -> Dict[str, object]:
         rng = random.Random(self.seed + day_index)
         games_today = rng.sample(self.games, k=min(self.cfg.games_per_day, len(self.games)))
+        if self.cfg.games_per_day > len(self.games):
+            print(f"[DayNightTrainer] games_per_day={self.cfg.games_per_day} but only len(games)={len(self.games)}. Sampling len(games) instead.")
 
         # Start-of-day: prefetch a tiny base set so we can act immediately.
         if self.base_experts:
@@ -655,6 +692,41 @@ class DayNightTrainer:
             # New night starts next day.
             self._dirty_since_night.clear()
 
+
+        # Richer cache stats (totals + optional boundary window)
+        day_cache: Dict[str, Dict[str, object]] = {}
+        for g in games_today:
+            ds = day_summaries[g]
+            s = ds.store_stats
+            entry: Dict[str, object] = {
+                "hbm_hit_rate": s.hit_rate(),
+                "miss_rate": s.miss_rate() if hasattr(s, "miss_rate") else (1.0 - s.hit_rate()),
+                "hbm_hits": int(s.hbm_hits),
+                "hbm_misses": int(s.hbm_misses),
+                "stall_time_s": float(s.stall_time_s),
+                "nvme_reads": int(s.nvme_reads),
+                "nvme_writes": int(s.nvme_writes),
+                "bytes_nvme_read": int(s.bytes_nvme_read),
+                "bytes_nvme_write": int(s.bytes_nvme_write),
+                "bytes_h2d": int(s.bytes_h2d),
+                "bytes_d2h": int(s.bytes_d2h),
+                "hbm_evictions": int(s.hbm_evictions),
+                "dram_evictions": int(s.dram_evictions),
+            }
+
+            bs = ds.boundary_store_stats
+            if bs is not None:
+                entry.update({
+                    "boundary_hbm_hit_rate": bs.hit_rate(),
+                    "boundary_miss_rate": bs.miss_rate() if hasattr(bs, "miss_rate") else (1.0 - bs.hit_rate()),
+                    "boundary_stall_time_s": float(bs.stall_time_s),
+                    "boundary_nvme_reads": int(bs.nvme_reads),
+                    "boundary_nvme_writes": int(bs.nvme_writes),
+                    "boundary_bytes_nvme_read": int(bs.bytes_nvme_read),
+                    "boundary_bytes_nvme_write": int(bs.bytes_nvme_write),
+                })
+
+            day_cache[g] = entry
         out: Dict[str, object] = {
             "day": int(day_index),
             "games_today": games_today,
@@ -668,15 +740,7 @@ class DayNightTrainer:
                 for g in games_today
             },
             "n_episodes": {g: int(len(day_summaries[g].episode_returns)) for g in games_today},
-            "day_cache": {
-                g: {
-                    "hbm_hit_rate": day_summaries[g].store_stats.hit_rate(),
-                    "stall_time_s": day_summaries[g].store_stats.stall_time_s,
-                    "nvme_reads": day_summaries[g].store_stats.nvme_reads,
-                    "nvme_writes": day_summaries[g].store_stats.nvme_writes,
-                }
-                for g in games_today
-            },
+            "day_cache": day_cache,
             "flagged_experts": {g: self.flagged_experts[g] for g in games_today},
             "sleep": sleep_metrics,
             "ewc_tasks": len(self.ewc.tasks),

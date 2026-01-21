@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 import torch
 import torch.nn as nn
@@ -32,6 +31,10 @@ class ExpertStoreStats:
         denom = self.hbm_hits + self.hbm_misses
         return float(self.hbm_hits) / float(denom) if denom > 0 else 0.0
 
+    def miss_rate(self) -> float:
+        denom = self.hbm_hits + self.hbm_misses
+        return float(self.hbm_misses) / float(denom) if denom > 0 else 0.0
+
 
 def _state_dict_to_cpu(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
@@ -45,7 +48,7 @@ def _state_dict_to_cpu(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
 
 def _optimizer_state_to_cpu(state: Dict) -> Dict:
     # Deep-ish copy where tensor leaves are moved to CPU.
-    out = {}
+    out: Dict = {}
     for k, v in state.items():
         if torch.is_tensor(v):
             out[k] = v.detach().cpu()
@@ -73,18 +76,16 @@ def _module_device(module: nn.Module) -> torch.device:
 
 
 class ExpertStore:
-    """A minimal "real" expert store that pages experts across GPU (HBM), CPU (DRAM), and disk (NVMe).
+    """Pages experts across GPU (HBM), CPU (DRAM), and disk (NVMe).
 
-    This is intentionally a research scaffold:
-    - Experts are nn.Modules already owned by a parent model (typically a ModuleList).
-    - The store controls where each expert's parameters live.
-    - It maintains simple LRU caches for GPU and CPU tiers.
-    - When evicting from CPU beyond budget, it writes weights (+ optional optimizer state) to disk and moves
-      the expert module to the 'meta' device to free RAM.
+    Key correctness feature:
+      - Step-scoped pinning via begin_step()/end_step(): experts that participate in the current
+        autograd graph are protected from eviction until end_step().
 
-    Notes:
-    - Disk tier uses torch.save/torch.load. It's not the fastest, but it's simple and robust.
-    - This store is designed to support sparse MoE usage (top-k experts per step).
+    This is a research scaffold and intentionally simple:
+      - Disk tier uses torch.save/torch.load.
+      - GPU/CPU tiers use a basic LRU.
+      - Online store optionally maintains per-expert Adam optimizers.
     """
 
     def __init__(
@@ -125,7 +126,6 @@ class ExpertStore:
 
         # Per-expert optimizer (only for the online network). Target store can disable.
         self._optims: Dict[int, torch.optim.Optimizer] = {}
-        self._optim_state_disk: Dict[int, Path] = {}
 
         self.stats = ExpertStoreStats()
 
@@ -151,8 +151,7 @@ class ExpertStore:
         if p.device.type != self.device.type:
             return False
 
-        # torch.device('cuda') is not equal to torch.device('cuda:0'). If the store
-        # was initialized with an index-less CUDA device, treat any CUDA index as GPU-resident.
+        # torch.device('cuda') != torch.device('cuda:0'); treat any cuda index as resident when store device has no index.
         if self.device.type == "cuda" and self.device.index is None:
             return True
 
@@ -193,21 +192,16 @@ class ExpertStore:
         e = self.experts[expert_id]
         path = self.expert_path(expert_id)
 
-        # Ensure weights are on CPU for portability
-        sd_cpu = _state_dict_to_cpu(e.state_dict())
-
-        payload = {"state_dict": sd_cpu}
+        payload: Dict = {"state_dict": _state_dict_to_cpu(e.state_dict())}
 
         if self.create_expert_optimizer and expert_id in self._optims:
-            opt = self._optims[expert_id]
-            opt_sd = opt.state_dict()
+            opt_sd = self._optims[expert_id].state_dict()
             payload["optim_state"] = _optimizer_state_to_cpu(opt_sd)
 
         t0 = time.perf_counter()
         torch.save(payload, path)
         dt = time.perf_counter() - t0
 
-        # Approx bytes written
         try:
             nbytes = path.stat().st_size
         except Exception:
@@ -224,8 +218,6 @@ class ExpertStore:
             raise FileNotFoundError(f"Expert {expert_id} not found on disk at {path}")
 
         t0 = time.perf_counter()
-        # NOTE: We avoid using newer torch.load(...) keyword args (e.g. weights_only)
-        # to stay compatible with the wide range of PyTorch versions seen in Colab.
         payload = torch.load(path, map_location="cpu")
         dt = time.perf_counter() - t0
 
@@ -239,7 +231,6 @@ class ExpertStore:
         self.stats.stall_time_s += float(dt)
 
         e = self.experts[expert_id]
-        # If expert is meta, materialize empty CPU tensors first.
         if self._is_on_meta(expert_id):
             e = e.to_empty(device="cpu")
         else:
@@ -252,17 +243,14 @@ class ExpertStore:
                 if p.device.type == "cpu":
                     p.data = p.data.pin_memory()
 
-        # Restore / create optimizer state
         if self.create_expert_optimizer:
-            # (re)create optimizer if missing
             if expert_id not in self._optims:
                 self._optims[expert_id] = torch.optim.Adam(e.parameters(), lr=self.expert_lr)
-
             opt = self._optims[expert_id]
             if "optim_state" in payload:
                 opt.load_state_dict(payload["optim_state"])
 
-    # ------------------ tier transitions ------------------
+    # ------------------ step-scoped pinning ------------------
 
     def begin_step(self) -> None:
         """Call before a training forward that will be followed by backward()."""
@@ -276,12 +264,12 @@ class ExpertStore:
         # Enforce budget after the step (evictions are safe now).
         self._evict_hbm_if_needed(protect=set())
 
+    # ------------------ tier transitions ------------------
 
     def _ensure_on_cpu(self, expert_id: int) -> None:
         expert_id = int(expert_id)
+
         if self._is_on_cpu(expert_id):
-            # Even if the module is already on CPU, make sure (a) the per-expert
-            # optimizer exists if requested and (b) its state tensors are on CPU.
             if self.create_expert_optimizer:
                 if expert_id not in self._optims:
                     self._optims[expert_id] = torch.optim.Adam(self.experts[expert_id].parameters(), lr=self.expert_lr)
@@ -295,15 +283,14 @@ class ExpertStore:
         if self._is_on_meta(expert_id):
             self._load_from_disk_to_cpu(expert_id)
         else:
-            # From GPU -> CPU
             e = self.experts[expert_id]
-            # Bookkeeping: no longer GPU-resident.
             self._remove_lru(self._hbm_lru, expert_id)
-            # Approx d2h bytes
+
             d2h = sum(int(p.numel() * p.element_size()) for p in e.parameters())
             t0 = time.perf_counter()
             e = e.to("cpu")
             dt = time.perf_counter() - t0
+
             self.stats.bytes_d2h += int(d2h)
             self.stats.stall_time_s += float(dt)
 
@@ -311,7 +298,6 @@ class ExpertStore:
                 for p in e.parameters():
                     p.data = p.data.pin_memory()
 
-            # Move optimizer state to CPU
             if self.create_expert_optimizer and expert_id in self._optims:
                 _move_optimizer_state_(self._optims[expert_id], torch.device("cpu"))
 
@@ -320,10 +306,9 @@ class ExpertStore:
 
     def _ensure_on_gpu(self, expert_id: int) -> None:
         expert_id = int(expert_id)
+
         if self._is_on_gpu(expert_id):
-            # IMPORTANT: parameters can end up on GPU while optimizer state is still
-            # on CPU (e.g., after a checkpoint restore, or accidental external `.to()` calls).
-            # Make this path robust by ensuring optimizer/state residency too.
+            # Ensure optimizer state lives on the same device as params.
             if self.create_expert_optimizer:
                 if expert_id not in self._optims:
                     self._optims[expert_id] = torch.optim.Adam(self.experts[expert_id].parameters(), lr=self.expert_lr)
@@ -341,35 +326,32 @@ class ExpertStore:
         self._ensure_on_cpu(expert_id)
 
         e = self.experts[expert_id]
-        # Approx h2d bytes
         h2d = sum(int(p.numel() * p.element_size()) for p in e.parameters())
 
         t0 = time.perf_counter()
         e = e.to(self.device, non_blocking=True)
-        # If we want true overlap we'd need streams; here we time the blocking move.
         if self.device.type == "cuda":
-            # Synchronize the current CUDA device for timing stability.
             torch.cuda.synchronize()
         dt = time.perf_counter() - t0
 
         self.stats.bytes_h2d += int(h2d)
         self.stats.stall_time_s += float(dt)
 
-        # Bookkeeping: after moving to GPU, it is no longer in DRAM.
+        # After moving to GPU, it is no longer DRAM-resident.
         self._remove_lru(self._dram_lru, expert_id)
 
         # Move optimizer state to GPU
         if self.create_expert_optimizer:
             if expert_id not in self._optims:
-                # If we didn't have it (e.g. expert was on disk without optimizer yet)
                 self._optims[expert_id] = torch.optim.Adam(e.parameters(), lr=self.expert_lr)
             _move_optimizer_state_(self._optims[expert_id], self.device)
 
         self._touch_lru(self._hbm_lru, expert_id)
         if self._pin_active:
             self._pinned_hbm.add(expert_id)
-        self._evict_hbm_if_needed(protect=set([expert_id]))
 
+        # Enforce cap (but do not evict the one we just brought in).
+        self._evict_hbm_if_needed(protect=set([expert_id]))
 
     def _evict_hbm_if_needed(self, protect: Optional[Set[int]] = None) -> None:
         protect = protect or set()
@@ -379,8 +361,8 @@ class ExpertStore:
             protect |= set(self._pinned_hbm)
 
         while len(self._hbm_lru) > self.hbm_capacity:
-            # Evict least recently used that is not protected.
-            evict_id = None
+            # Evict LRU that is not protected.
+            evict_id: Optional[int] = None
             for cand in reversed(self._hbm_lru):
                 if cand not in protect:
                     evict_id = cand
@@ -394,31 +376,24 @@ class ExpertStore:
                 # Outside a step, evict absolute LRU.
                 evict_id = self._hbm_lru[-1]
 
-            self._hbm_lru.remove(evict_id)
+            self._hbm_lru.remove(int(evict_id))
             self.stats.hbm_evictions += 1
-            # Move to CPU (DRAM)
-            self._ensure_on_cpu(evict_id)
-
+            self._ensure_on_cpu(int(evict_id))
 
     def _evict_dram_if_needed(self) -> None:
         if not self.enable_disk:
-            # Without disk tier, just keep on CPU; ignore DRAM budget.
             return
 
         while len(self._dram_lru) > self.dram_capacity:
-            evict_id = self._dram_lru.pop()  # LRU
+            evict_id = int(self._dram_lru.pop())
             self.stats.dram_evictions += 1
 
-            # Persist to disk
             self._save_to_disk(evict_id)
 
-            # Drop optimizer (will be recreated on reload)
             if evict_id in self._optims:
                 del self._optims[evict_id]
 
-            # Move module to meta to free CPU memory
-            e = self.experts[int(evict_id)]
-            e.to("meta")
+            self.experts[evict_id].to("meta")
 
     # ------------------ public API ------------------
 
@@ -428,19 +403,15 @@ class ExpertStore:
             return
 
         for eid in range(self.num_experts):
-            # Save (weights + any optimizer state if present)
             self._save_to_disk(eid)
-            # Drop optimizer
             if eid in self._optims:
                 del self._optims[eid]
-            # Move to meta
             self.experts[eid].to("meta")
 
         self._hbm_lru.clear()
         self._dram_lru.clear()
 
     def prefetch_to_gpu(self, expert_ids: Sequence[int]) -> None:
-        # Best-effort: ensure these experts on GPU now.
         uniq: List[int] = []
         for e in expert_ids:
             e = int(e)
@@ -449,7 +420,6 @@ class ExpertStore:
         protect = set(uniq)
         for e in uniq:
             self._ensure_on_gpu(e)
-        # enforce cap with protection (try not to evict prefetched)
         self._evict_hbm_if_needed(protect=protect)
 
     def ensure_on_gpu(self, expert_ids: Sequence[int]) -> None:
@@ -464,7 +434,6 @@ class ExpertStore:
         self._evict_hbm_if_needed(protect=protect)
 
     def ensure_on_cpu(self, expert_ids: Sequence[int]) -> None:
-        """Ensure experts are materialized on CPU (DRAM), without moving them to GPU."""
         uniq: List[int] = []
         for e in expert_ids:
             e = int(e)
@@ -474,7 +443,6 @@ class ExpertStore:
             self._ensure_on_cpu(e)
 
     def prefetch_to_cpu(self, expert_ids: Sequence[int]) -> None:
-        """Alias for ensure_on_cpu; included for symmetry."""
         self.ensure_on_cpu(expert_ids)
 
     def get_optimizer(self, expert_id: int) -> Optional[torch.optim.Optimizer]:
@@ -487,16 +455,7 @@ class ExpertStore:
                 opt.zero_grad(set_to_none=True)
 
     def step(self, expert_ids: Iterable[int]) -> None:
-        # Defensive: experts may be moved across devices (GPU<->CPU) between the
-        # backward pass and the optimizer step (e.g., due to paging / eviction).
-        #
-        # PyTorch optimizers do NOT automatically move their state tensors, and
-        # module.to(device) does not reliably move parameter .grad tensors.
-        #
-        # To prevent "cuda vs cpu" errors inside Adam, we align BOTH:
-        #   (1) optimizer state tensors (exp_avg, exp_avg_sq, ...) and
-        #   (2) parameter gradients
-        # to the expert's current parameter device before calling opt.step().
+        # Align parameter grads and optimizer state device before stepping.
         for e in set(int(x) for x in expert_ids):
             opt = self._optims.get(e)
             if opt is None:
@@ -504,7 +463,6 @@ class ExpertStore:
             mod = self.experts[e]
             dev = _module_device(mod)
 
-            # Ensure gradients are on the same device as parameters.
             for p in mod.parameters():
                 if p.grad is not None and p.grad.device != dev:
                     p.grad = p.grad.to(dev, non_blocking=True)
@@ -524,7 +482,6 @@ class ExpertStore:
             return
         ids = sorted(set(int(x) for x in expert_ids))
         for eid in ids:
-            # Ensure weights are on CPU for portable saving.
             self._ensure_on_cpu(eid)
             self._save_to_disk(eid)
 
@@ -535,15 +492,14 @@ class ExpertStore:
         writeback_ids: Optional[Iterable[int]] = None,
         clear_hbm: bool = True,
     ) -> None:
-        """
-        End-of-night behavior:
-          - Optionally write back dirty experts to disk
-          - Keep `retain_cpu_ids` resident on CPU (DRAM)
-          - Drop everything else currently resident (HBM/DRAM) to meta to free memory
-          - Optionally clear the HBM tier
+        """End-of-night behavior.
 
-        IMPORTANT: This requires `enable_disk=True`. If disk is disabled, we do nothing
-        (dropping to meta would lose weights).
+        - Optionally write back `writeback_ids` to disk
+        - Keep `retain_cpu_ids` resident on CPU (DRAM)
+        - Drop everything else currently resident (HBM/DRAM) to meta to free memory
+        - Optionally clear the HBM tier
+
+        Requires enable_disk=True; otherwise dropping to meta would lose weights.
         """
         if not self.enable_disk:
             return
@@ -571,14 +527,13 @@ class ExpertStore:
             self.save_experts_to_disk(writeback_ids)
 
         # Collect resident experts (HBM + DRAM).
-        resident_hbm = list(self._hbm_lru)
-        resident_dram = list(self._dram_lru)
-        resident = set(resident_hbm + resident_dram)
+        resident = set(self._hbm_lru + self._dram_lru)
 
         # Drop non-retained experts to meta to free memory.
         for eid in sorted(resident):
             if eid in retain_set:
                 continue
+
             # If on GPU, move to CPU first (then to meta), so we don't keep CUDA allocations around.
             if self._is_on_gpu(eid):
                 e = self.experts[eid]
@@ -589,10 +544,12 @@ class ExpertStore:
                 dt = time.perf_counter() - t0
                 self.stats.bytes_d2h += int(d2h)
                 self.stats.stall_time_s += float(dt)
+
                 if self._can_pin:
                     for p in e.parameters():
                         if p.device.type == "cpu":
                             p.data = p.data.pin_memory()
+
                 if self.create_expert_optimizer and eid in self._optims:
                     _move_optimizer_state_(self._optims[eid], torch.device("cpu"))
 
@@ -603,7 +560,7 @@ class ExpertStore:
             if eid in self._optims:
                 del self._optims[eid]
 
-            # Finally move to meta.
+            # Move to meta to free memory.
             self.experts[eid].to("meta")
 
         # Clear HBM tier if requested (retained experts should already be on CPU).
@@ -616,11 +573,10 @@ class ExpertStore:
         # Enforce DRAM capacity if caller provided an oversized list.
         self._evict_dram_if_needed()
 
-
     def flush_resident_to_disk(self) -> None:
         """Best-effort: persist all currently materialized experts to disk.
 
-        This is useful in Colab so that you don't lose expert weights/optim state if the runtime dies.
+        Useful in Colab so you don't lose expert weights/optim state if the runtime dies.
         """
         if not self.enable_disk:
             return
