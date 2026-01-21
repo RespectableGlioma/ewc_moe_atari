@@ -1,4 +1,16 @@
+
 from __future__ import annotations
+
+# EWC utilities for continual learning in the day/night MoE Atari scaffold.
+#
+# This file is intentionally defensive for out-of-core expert paging:
+# - Experts can be on GPU/CPU/meta depending on the cache tier.
+# - We avoid toggling requires_grad flags (a common source of "loss has no grad_fn").
+# - Fisher accumulation is always done on CPU.
+# - If a parameter lives on the 'meta' device, we skip it (can't compute penalty / snapshot).
+#
+# Sentinel for debugging:
+EWC_VERSION = "EWC_V12_GRADFIX"
 
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, Iterator, Optional
@@ -8,12 +20,10 @@ import torch.nn as nn
 
 
 FilterFn = Optional[Callable[[str], bool]]
-LossFn = Callable[[nn.Module, object], torch.Tensor]
 
 
 @dataclass
 class TaskSnapshot:
-    """EWC snapshot for a single task/domain."""
     name: str
     params_star: Dict[str, torch.Tensor]   # CPU tensors
     fisher_diag: Dict[str, torch.Tensor]   # CPU tensors
@@ -21,97 +31,90 @@ class TaskSnapshot:
 
 def estimate_fisher_diag(
     model: nn.Module,
+    batches: Iterable[Dict[str, torch.Tensor]],
     *,
-    batches: Iterable[object],
-    loss_fn: LossFn,
+    loss_fn: Callable[[nn.Module, Dict[str, torch.Tensor]], torch.Tensor],
     filter_fn: FilterFn = None,
     max_batches: int = 25,
     begin_step_fn: Optional[Callable[[], None]] = None,
     end_step_fn: Optional[Callable[[], None]] = None,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Estimate diagonal Fisher information (approx) via squared gradients:
-        F ≈ E[ (∂L/∂θ)^2 ]
+    """Estimate a diagonal Fisher approximation via squared gradients.
 
-    Key design choices for out-of-core / paging:
-    - We ALWAYS accumulate Fisher buffers on CPU to avoid device-mismatch issues
-      when experts page CPU<->GPU between batches.
-    - We DO NOT toggle requires_grad flags for parameters (that can accidentally
-      freeze the whole model if name filters mismatch and produce a loss with
-      no grad_fn). Instead we compute grads normally and only *accumulate*
-      for parameters that pass filter_fn.
-    - We wrap each batch in torch.enable_grad() so this works even if called from
-      a no_grad() context higher up.
-    - If begin_step_fn/end_step_fn are provided (ExpertStore pinning), we call
-      begin_step_fn() before forward and end_step_fn() only AFTER we've copied
-      gradients into CPU buffers.
+    Robustness goals:
+    - Never crash if a batch produces a loss without grad_fn (skip it).
+    - Never depend on parameter device stability (accumulate fisher on CPU).
+    - Never mutate requires_grad flags (can accidentally freeze everything).
     """
-    if max_batches <= 0:
-        return {}
-
-    was_training = model.training
-    # Keep model mode as-is; Fisher is meant to reflect training dynamics.
-    # We only ensure grad is enabled.
     fisher: Dict[str, torch.Tensor] = {}
-    n = 0
+    n_ok = 0
+    n_skipped_no_grad = 0
 
-    try:
-        with torch.enable_grad():
-            for batch in batches:
-                if n >= max_batches:
-                    break
+    # Ensure model is in train mode for gradient computation; this is typical for Fisher estimation.
+    # (Does not change grad-enabled state.)
+    model.train()
 
-                if begin_step_fn is not None:
-                    begin_step_fn()
+    for batch in batches:
+        if n_ok >= int(max_batches):
+            break
 
-                try:
-                    # Clear grads
-                    model.zero_grad(set_to_none=True)
+        if begin_step_fn is not None:
+            begin_step_fn()
 
-                    loss = loss_fn(model, batch)
-                    if not torch.is_tensor(loss):
-                        # Defensive: allow loss_fn to return python floats (shouldn't happen)
-                        loss = torch.as_tensor(loss, device=next(model.parameters()).device)
+        try:
+            model.zero_grad(set_to_none=True)
 
-                    # Ensure scalar
-                    if loss.ndim != 0:
-                        loss = loss.mean()
+            # Make absolutely sure autograd is enabled in case the caller is in a no_grad context.
+            with torch.enable_grad():
+                loss = loss_fn(model, batch)
 
-                    # If loss doesn't require grad, backprop will fail. This can happen
-                    # if someone wrapped Fisher in inference_mode/no_grad, or if all
-                    # parameters were frozen externally. We try to continue gracefully.
-                    if not loss.requires_grad:
-                        # Still count the batch so we don't infinite loop on weird iterators.
-                        n += 1
-                        continue
+            if not torch.is_tensor(loss):
+                # allow loss_fn to return python floats (shouldn't happen, but be defensive)
+                loss = torch.as_tensor(loss, device=next(model.parameters()).device)
 
-                    loss.backward()
+            # If the loss isn't connected to any parameters, backward() will error.
+            # This can happen if someone accidentally disabled requires_grad or computed loss under no_grad.
+            if not loss.requires_grad:
+                n_skipped_no_grad += 1
+                continue
 
-                    # Accumulate squared grads on CPU.
-                    for name, p in model.named_parameters():
-                        if filter_fn is not None and not filter_fn(name):
-                            continue
-                        if p.grad is None:
-                            continue
-                        g2_cpu = p.grad.detach().float().cpu().pow(2)
-                        if name not in fisher:
-                            fisher[name] = torch.zeros_like(g2_cpu, device="cpu")
-                        fisher[name] += g2_cpu
+            loss.backward()
 
-                    n += 1
+            # Accumulate squared grads for selected parameters.
+            for name, p in model.named_parameters():
+                if filter_fn is not None and not filter_fn(name):
+                    continue
+                if p.grad is None:
+                    continue
+                # Meta params can't be used here; skip (out-of-core expert not materialized).
+                if p.device.type == "meta":
+                    continue
 
-                finally:
-                    # IMPORTANT: only unpin/evict after we've read grads.
-                    if end_step_fn is not None:
-                        end_step_fn()
+                g2 = p.grad.detach().float().cpu().pow(2)
+                if name not in fisher:
+                    fisher[name] = torch.zeros_like(g2, device="cpu")
+                fisher[name] += g2
 
-    finally:
-        model.train(was_training)
+            n_ok += 1
 
-    # Normalize
-    denom = max(1, n)
-    for k in list(fisher.keys()):
-        fisher[k] = fisher[k] / float(denom)
+        finally:
+            # IMPORTANT: only evict after we've copied grads to CPU.
+            if end_step_fn is not None:
+                end_step_fn()
+
+    # Normalize by number of successful batches.
+    if n_ok > 0:
+        inv = 1.0 / float(n_ok)
+        for k in list(fisher.keys()):
+            fisher[k].mul_(inv)
+
+    # If everything was skipped, emit a single-line warning for debugging.
+    if n_ok == 0 and n_skipped_no_grad > 0:
+        # Avoid noisy prints; but one message helps users find the issue.
+        print(
+            f"[estimate_fisher_diag] WARNING: skipped {n_skipped_no_grad} fisher batches "
+            f"because loss.requires_grad was False. Returning empty fisher."
+        )
 
     return fisher
 
@@ -123,57 +126,73 @@ def make_snapshot(
     fisher_diag: Dict[str, torch.Tensor],
     filter_fn: FilterFn = None,
 ) -> TaskSnapshot:
-    """
-    Create a CPU snapshot of parameters and Fisher diag for EWC penalty.
+    """Create a snapshot of current parameters (theta*) and fisher diag.
+
+    Stored tensors are on CPU for portability. Meta parameters are skipped.
     """
     params_star: Dict[str, torch.Tensor] = {}
-    with torch.no_grad():
-        for n, p in model.named_parameters():
-            if filter_fn is not None and not filter_fn(n):
-                continue
-            # store CPU copy
-            params_star[n] = p.detach().cpu().clone()
-
-    # Ensure fisher is CPU + detached
-    fisher_cpu: Dict[str, torch.Tensor] = {}
-    for n, f in fisher_diag.items():
+    for n, p in model.named_parameters():
         if filter_fn is not None and not filter_fn(n):
             continue
-        fisher_cpu[n] = f.detach().cpu().clone()
+        if p.device.type == "meta":
+            continue
+        params_star[n] = p.detach().float().cpu().clone()
+
+    # Ensure fisher tensors are CPU float
+    fisher_cpu: Dict[str, torch.Tensor] = {}
+    for n, f in fisher_diag.items():
+        if not torch.is_tensor(f):
+            continue
+        fisher_cpu[n] = f.detach().float().cpu()
 
     return TaskSnapshot(name=name, params_star=params_star, fisher_diag=fisher_cpu)
 
 
 class EWC:
-    """
-    Elastic Weight Consolidation penalty:
-        penalty = (λ/2) * Σ_tasks Σ_params F_i (θ_i - θ*_i)^2
-    where F_i is diagonal Fisher estimate and θ* is the snapshot parameter value.
-    """
-    def __init__(self, *, lambda_: float = 0.4):
+    def __init__(self, lambda_: float = 0.0):
         self.lambda_ = float(lambda_)
         self.tasks: list[TaskSnapshot] = []
 
-    def add_task_snapshot(self, snap: TaskSnapshot) -> None:
-        self.tasks.append(snap)
+    def add_task_snapshot(self, snapshot: TaskSnapshot) -> None:
+        self.tasks.append(snapshot)
 
     def penalty(self, model: nn.Module) -> torch.Tensor:
-        if not self.tasks or self.lambda_ <= 0.0:
-            # Make sure penalty is on the right device
+        """Compute EWC quadratic penalty on the current model parameters.
+
+        Out-of-core safety:
+        - Skip any parameters currently on 'meta' (not materialized).
+        - Only penalize parameters present in each task snapshot.
+        """
+        if self.lambda_ <= 0.0 or not self.tasks:
+            # return a tensor on the model device to avoid device mismatch when added to loss
             dev = next(model.parameters()).device
             return torch.zeros((), device=dev)
 
-        dev = next(model.parameters()).device
-        total = torch.zeros((), device=dev)
-
-        # We iterate model params once per task. This is fine at small scale and
-        # avoids needing to keep GPU copies of all snapshots.
-        for task in self.tasks:
-            for n, p in model.named_parameters():
-                if n not in task.fisher_diag:
+        # We'll accumulate on the device of the current params (typically GPU).
+        total = None
+        for name, p in model.named_parameters():
+            if p.device.type == "meta":
+                continue
+            # Only penalize if any task has fisher for this param.
+            # We gather task terms lazily to avoid repeated dict lookups.
+            term = None
+            for task in self.tasks:
+                f = task.fisher_diag.get(name, None)
+                s = task.params_star.get(name, None)
+                if f is None or s is None:
                     continue
-                f = task.fisher_diag[n].to(dev, non_blocking=True)
-                p_star = task.params_star[n].to(dev, non_blocking=True)
-                total = total + (f * (p - p_star).pow(2)).sum()
+                # Move fisher and star to param device on demand.
+                f_d = f.to(device=p.device, non_blocking=True)
+                s_d = s.to(device=p.device, non_blocking=True)
+                t = (f_d * (p - s_d).pow(2)).sum()
+                term = t if term is None else (term + t)
+
+            if term is None:
+                continue
+            total = term if total is None else (total + term)
+
+        if total is None:
+            dev = next(model.parameters()).device
+            return torch.zeros((), device=dev)
 
         return 0.5 * self.lambda_ * total
