@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
@@ -26,27 +27,12 @@ def linear_epsilon(step: int, start: float, end: float, decay_steps: int) -> flo
     return float(start + t * (end - start))
 
 
-def _add_store_stats(a: Optional[ExpertStoreStats], b: Optional[ExpertStoreStats]) -> ExpertStoreStats:
-    """Fieldwise sum of two ExpertStoreStats (None treated as zeros)."""
-    if a is None and b is None:
-        return ExpertStoreStats()
-    if a is None:
-        return b  # type: ignore[return-value]
-    if b is None:
-        return a
-    out = ExpertStoreStats()
-    for name in out.__dataclass_fields__.keys():
-        setattr(out, name, getattr(a, name) + getattr(b, name))
-    return out
-
-
 @dataclass
 class DayStats:
     episode_returns: List[float]
     steps: int
     expert_scores: np.ndarray  # (num_experts,)
     store_stats: ExpertStoreStats
-    boundary_store_stats: Optional[ExpertStoreStats] = None
 
 
 class DayNightTrainer:
@@ -139,6 +125,28 @@ class DayNightTrainer:
         # Track which experts were updated since last target sync
         self._dirty_experts: Set[int] = set()
 
+        # Track which experts were updated since the start of the current night (for NVMe writeback).
+        self._dirty_since_night: Set[int] = set()
+
+        # A tiny generic 'base' expert set kept warm across all days (helps act immediately).
+        base_n = int(getattr(self.cfg, 'base_warm_experts', 2))
+        base_n = max(0, min(base_n, int(self.cfg.num_experts)))
+        # Don't exceed HBM capacity when we prefetch the base set.
+        base_n = min(base_n, int(self.cfg.hbm_expert_capacity))
+        self.base_experts: List[int] = list(range(base_n))
+
+        # Warm DRAM set retained across days (capacity-limited).
+        self.warm_experts: List[int] = list(self.base_experts)
+
+        # Decayed retention scores used to pick the warm set each night.
+        self._retain_scores = np.zeros((self.cfg.num_experts,), dtype=np.float32)
+
+        # Ensure base experts are materialized on CPU so day-0 can act immediately after a cold start.
+        if self.cfg.enable_nvme_tier and self.base_experts:
+            self.expert_store.ensure_on_cpu(self.base_experts)
+            self.target_store.ensure_on_cpu(self.base_experts)
+
+
         # Optional checkpoint dir
         if self.run_dir is not None:
             (self.run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -171,16 +179,12 @@ class DayNightTrainer:
 
         self.expert_store.reset_stats()
 
-        boundary_steps = int(getattr(self.cfg, 'boundary_steps', 200))
-        boundary_steps = max(0, min(boundary_steps, int(steps)))
-        boundary_stats: Optional[ExpertStoreStats] = None
-
         episode_return = 0.0
         episode_returns: List[float] = []
 
         expert_scores = np.zeros((self.cfg.num_experts,), dtype=np.float32)
 
-        for step_i in range(int(steps)):
+        for _ in range(int(steps)):
             eps = linear_epsilon(self.global_step, self.cfg.epsilon_start, self.cfg.epsilon_end, self.cfg.epsilon_decay_steps)
 
             obs_t = torch.from_numpy(obs).to(self.device)
@@ -235,9 +239,6 @@ class DayNightTrainer:
             else:
                 obs = next_obs
 
-            if boundary_steps > 0 and (step_i + 1) == boundary_steps:
-                boundary_stats = self.expert_store.reset_stats()
-
             self.global_step += 1
 
         env.close()
@@ -245,14 +246,12 @@ class DayNightTrainer:
         # End any partial episode
         self.sleep_buffer.end_episode(game_id)
 
-        rest_stats = self.expert_store.reset_stats()
-        store_stats = _add_store_stats(boundary_stats, rest_stats) if boundary_stats is not None else rest_stats
+        store_stats = self.expert_store.reset_stats()
         return DayStats(
             episode_returns=episode_returns,
             steps=int(steps),
             expert_scores=expert_scores,
             store_stats=store_stats,
-            boundary_store_stats=boundary_stats,
         )
 
     @torch.no_grad()
@@ -316,26 +315,16 @@ class DayNightTrainer:
 
         B, T = actions.shape
 
+        # Optional router auxiliary losses to encourage expert diversity / reduce collapse.
+        entropy_coef = float(getattr(self.cfg, 'router_entropy_coef', getattr(self.cfg, 'router_entropy_weight', 0.0)))
+        balance_coef = float(getattr(self.cfg, 'router_load_balance_coef', getattr(self.cfg, 'router_balance_coef', 0.0)))
+        aux_entropy = torch.zeros((), device=self.device)
+        aux_kl = torch.zeros((), device=self.device)
+        aux_n = 0
+
+
         hidden = self.model.init_hidden(B, obs.device)
         total_loss = torch.zeros((), device=obs.device)
-        # Optional MoE auxiliary losses to discourage router collapse.
-        # These operate only on router probabilities (no extra model changes needed).
-        #
-        # Defaults are intentionally non-zero so you get anti-collapse behavior
-        # even if your Config doesn't have these fields yet.
-        moe_balance_coef = float(getattr(self.cfg, "moe_balance_coef", 0.01))
-        moe_entropy_coef = float(getattr(self.cfg, "moe_entropy_coef", 0.001))
-        if not include_moe_aux:
-            moe_balance_coef = 0.0
-            moe_entropy_coef = 0.0
-
-        use_moe_aux = (moe_balance_coef > 0.0) or (moe_entropy_coef > 0.0)
-        if use_moe_aux:
-            E = int(self.cfg.num_experts)
-            importance = torch.zeros((E,), device=obs.device)
-            load = torch.zeros((E,), device=obs.device)
-            entropy_sum = torch.zeros((), device=obs.device)
-
 
         for t in range(T):
             out = self.model(
@@ -347,22 +336,21 @@ class DayNightTrainer:
             )
             q = out.q_values
             hidden = out.hidden
-            if use_moe_aux:
-                g = out.gating_probs
-                # Expect g to be (B, E). Be robust to (E,) or (B, K) by best-effort.
+
+            # Router aux stats (gating probabilities) for load balancing / entropy regularization
+            if include_moe_aux and (entropy_coef > 0.0 or balance_coef > 0.0):
+                g = getattr(out, 'gating_probs', None)
                 if g is not None:
-                    if g.ndim == 1:
-                        g = g.unsqueeze(0)
-                    # If for some reason the model returns only top-k probs, skip aux loss
-                    # (the full distribution is required for meaningful balancing).
-                    if g.ndim == 2 and g.shape[-1] == int(self.cfg.num_experts):
-                        importance = importance + g.sum(dim=0)
-                        entropy_sum = entropy_sum + (-(g * (g + 1e-9).log()).sum(dim=-1).mean())
-                        topk = int(self.cfg.expert_top_k)
-                        k = min(max(topk, 1), int(self.cfg.num_experts))
-                        top_ids = torch.topk(g, k=k, dim=-1).indices
-                        counts = torch.bincount(top_ids.reshape(-1), minlength=int(self.cfg.num_experts)).to(g.dtype)
-                        load = load + counts
+                    eps = 1e-8
+                    g = g / (g.sum(dim=-1, keepdim=True) + eps)
+                    ent = -(g * (g + eps).log()).sum(dim=-1).mean()
+                    aux_entropy = aux_entropy + ent
+                    mean_g = g.mean(dim=0)
+                    mean_g = mean_g / (mean_g.sum() + eps)
+                    uniform = torch.full_like(mean_g, 1.0 / mean_g.numel())
+                    kl = (mean_g * ((mean_g + eps).log() - (uniform + eps).log())).sum()
+                    aux_kl = aux_kl + kl
+                    aux_n += 1
 
 
             # Reset hidden where done
@@ -384,18 +372,6 @@ class DayNightTrainer:
             w = w / (w.mean() + 1e-6)
 
             total_loss = total_loss + (w * huber).mean()
-
-        if use_moe_aux:
-            # Load-balancing using the *actual* top-k assignments (penalizes collapse even if probs are uniform).
-            if moe_balance_coef > 0.0:
-                p_load = load / (load.sum() + 1e-9)
-                cv2 = p_load.var(unbiased=False) / (p_load.mean().pow(2) + 1e-9)
-                total_loss = total_loss + moe_balance_coef * cv2
-
-            # Encourage higher-entropy routing (anti-collapse).
-            if moe_entropy_coef > 0.0:
-                entropy = entropy_sum / float(T)
-                total_loss = total_loss - moe_entropy_coef * entropy
 
         if include_ewc:
             total_loss = total_loss + self.ewc.penalty(self.model)
@@ -433,10 +409,8 @@ class DayNightTrainer:
     def _make_ewc_filter_fn(self, game_id: str):
         flagged = set(self.flagged_experts.get(game_id, []))
 
-        protect_router = bool(getattr(self.cfg, "protect_router", False))
-
         def keep(name: str) -> bool:
-            if protect_router and name.startswith("router."):
+            if name.startswith("router."):
                 return True
             if self.cfg.protect_encoder and name.startswith("encoder."):
                 return True
@@ -489,7 +463,7 @@ class DayNightTrainer:
             self.expert_store.reset_stats()
 
             losses: List[float] = []
-            used_counts: List[int] = []
+            used_counts: List[int] = []  # unique experts used per update
 
             for u in range(int(self.cfg.sleep_updates_per_game)):
                 sample = self.sleep_buffer.sample_sequences(
@@ -503,29 +477,40 @@ class DayNightTrainer:
 
                 used_experts: Set[int] = set()
 
-                self.core_optim.zero_grad(set_to_none=True)
-                # Best-effort zero for experts currently on GPU; more precise would require tracking.
-                self.expert_store.zero_grad(self.expert_store.experts_on_gpu())
-
-                loss = self._loss_on_sequence_batch(batch, used_experts=used_experts)
-                loss.backward()
-
-                # Clip grads
-                torch.nn.utils.clip_grad_norm_(list(self.model.encoder.parameters()) + list(self.model.router.parameters()), 10.0)
-                for eid in used_experts:
-                    torch.nn.utils.clip_grad_norm_(self.model.experts[eid].parameters(), 10.0)
-
-                self.core_optim.step()
-                self.expert_store.step(used_experts)
-
-                self._dirty_experts.update(used_experts)
-
-                updates += 1
-                losses.append(float(loss.detach().cpu().item()))
-                used_counts.append(int(len(used_experts)))
-
-                if updates % self.cfg.target_update_interval == 0:
-                    self._sync_target()
+                # Pin experts used in this step so they can't be evicted mid-backward.
+                if hasattr(self.expert_store, 'begin_step'):
+                    self.expert_store.begin_step()
+                try:
+    
+                    self.core_optim.zero_grad(set_to_none=True)
+                    # Best-effort zero for experts currently on GPU; more precise would require tracking.
+                    self.expert_store.zero_grad(self.expert_store.experts_on_gpu())
+    
+                    loss = self._loss_on_sequence_batch(batch, used_experts=used_experts)
+                    loss.backward()
+    
+                    # Clip grads
+                    torch.nn.utils.clip_grad_norm_(list(self.model.encoder.parameters()) + list(self.model.router.parameters()), 10.0)
+                    for eid in used_experts:
+                        torch.nn.utils.clip_grad_norm_(self.model.experts[eid].parameters(), 10.0)
+    
+                    self.core_optim.step()
+                    self.expert_store.step(used_experts)
+    
+                    self._dirty_experts.update(used_experts)
+                    if hasattr(self, '_dirty_since_night'):
+                        self._dirty_since_night.update(used_experts)
+                    used_counts.append(len(used_experts))
+    
+                    updates += 1
+                    losses.append(float(loss.detach().cpu().item()))
+    
+                    if updates % self.cfg.target_update_interval == 0:
+                        self._sync_target()
+    
+                finally:
+                    if hasattr(self.expert_store, 'end_step'):
+                        self.expert_store.end_step()
 
             # Fisher + snapshot after finishing this game in sleep
             fisher_filter = self._make_ewc_filter_fn(game_id)
@@ -534,6 +519,18 @@ class DayNightTrainer:
                 # Ensure flagged experts are materialized on GPU before fisher init
                 self.expert_store.ensure_on_gpu(flagged)
 
+            fisher_kwargs: Dict[str, object] = {}
+            try:
+                sig = inspect.signature(estimate_fisher_diag)
+                if 'begin_step_fn' in sig.parameters:
+                    fisher_kwargs = {
+                        'begin_step_fn': getattr(self.expert_store, 'begin_step', None),
+                        'end_step_fn': getattr(self.expert_store, 'end_step', None),
+                    }
+                    fisher_kwargs = {k: v for k, v in fisher_kwargs.items() if v is not None}
+            except Exception:
+                fisher_kwargs = {}
+
             fisher = estimate_fisher_diag(
                 self.model,
                 batches=self._iter_fisher_batches(game_id, max_batches=self.cfg.fisher_batches),
@@ -541,30 +538,24 @@ class DayNightTrainer:
                 loss_fn=lambda m, b: self._loss_on_sequence_batch(b, used_experts=set(), include_ewc=False, include_moe_aux=False),
                 filter_fn=fisher_filter,
                 max_batches=self.cfg.fisher_batches,
+                **fisher_kwargs,
             )
             snapshot = make_snapshot(self.model, name=game_id, fisher_diag=fisher, filter_fn=fisher_filter)
             self.ewc.add_task_snapshot(snapshot)
-            # Prevent EWC from growing without bound (which can effectively freeze learning).
-            max_tasks = int(getattr(self.cfg, "ewc_max_tasks", 50))
-            if max_tasks > 0 and len(self.ewc.tasks) > max_tasks:
-                self.ewc.tasks = self.ewc.tasks[-max_tasks:]
 
-            s = self.expert_store.reset_stats()
-            metrics[f"sleep/{game_id}/hbm_hit_rate"] = s.hit_rate()
-            metrics[f"sleep/{game_id}/miss_rate"] = s.miss_rate() if hasattr(s, 'miss_rate') else (1.0 - s.hit_rate())
-            metrics[f"sleep/{game_id}/stall_time_s"] = s.stall_time_s
-            metrics[f"sleep/{game_id}/nvme_reads"] = s.nvme_reads
-            metrics[f"sleep/{game_id}/nvme_writes"] = s.nvme_writes
-            if used_counts:
+            # Router/expert diversity diagnostics during sleep updates
+            if 'used_counts' in locals() and used_counts:
                 metrics[f"sleep/{game_id}/unique_experts_mean"] = float(np.mean(used_counts))
                 metrics[f"sleep/{game_id}/unique_experts_p95"] = float(np.percentile(used_counts, 95))
                 metrics[f"sleep/{game_id}/unique_experts_max"] = float(np.max(used_counts))
+
+            s = self.expert_store.reset_stats()
+            metrics[f"sleep/{game_id}/hbm_hit_rate"] = s.hit_rate()
+            metrics[f"sleep/{game_id}/stall_time_s"] = s.stall_time_s
+            metrics[f"sleep/{game_id}/nvme_reads"] = s.nvme_reads
+            metrics[f"sleep/{game_id}/nvme_writes"] = s.nvme_writes
             metrics[f"sleep/{game_id}/mean_loss"] = float(np.mean(losses)) if losses else 0.0
             metrics[f"sleep/{game_id}/updates"] = float(self.cfg.sleep_updates_per_game)
-            if unique_counts:
-                metrics[f"sleep/{game_id}/unique_experts_mean"] = float(np.mean(unique_counts))
-                metrics[f"sleep/{game_id}/unique_experts_p95"] = float(np.percentile(unique_counts, 95))
-                metrics[f"sleep/{game_id}/unique_experts_max"] = float(np.max(unique_counts))
 
         metrics["sleep_total_updates"] = float(updates)
         return metrics
@@ -605,11 +596,71 @@ class DayNightTrainer:
         torch.save(payload, ckpt_path)
         return ckpt_path
 
+    def _select_warm_set(self, games_today: List[str], day_summaries: Dict[str, DayStats]) -> List[int]:
+        """Choose which experts to keep warm on CPU across days (DRAM tier).
+
+        This is a simple heuristic that supports the design you described:
+        - Router/backbone learns to page experts during the day.
+        - At night we write back any dirty experts.
+        - We keep a small warm DRAM set across days (capacity-limited).
+
+        The policy here is intentionally lightweight:
+        - Maintain a decayed retention score per expert.
+        - Add today's per-game expert_scores into that retention score.
+        - Always include base_experts.
+        - Fill remaining DRAM capacity with top retention-score experts.
+        """
+        # Decay past retention so old tasks slowly cool off.
+        retain_decay = float(getattr(self.cfg, 'retain_decay', getattr(self.cfg, 'warm_retain_decay', 0.9)))
+        retain_decay = float(min(max(retain_decay, 0.0), 0.9999))
+        if hasattr(self, '_retain_scores'):
+            self._retain_scores *= retain_decay
+
+        # Add today's expert usage/salience.
+        for g in games_today:
+            if g not in day_summaries:
+                continue
+            s = np.asarray(day_summaries[g].expert_scores, dtype=np.float32)
+            if not hasattr(self, '_retain_scores') or s.shape != self._retain_scores.shape:
+                continue
+            denom = float(np.max(np.abs(s)) + 1e-6)
+            self._retain_scores += (s / denom)
+
+        cap = int(self.cfg.dram_expert_capacity)
+        base = [int(x) for x in list(getattr(self, 'base_experts', []))]
+        base = base[:cap]
+        seen: Set[int] = set(base)
+
+        remaining = max(0, cap - len(base))
+        if remaining <= 0:
+            return base
+
+        order = np.argsort(-self._retain_scores).tolist() if hasattr(self, '_retain_scores') else list(range(self.cfg.num_experts))
+        warm: List[int] = []
+        for eid in order:
+            eid = int(eid)
+            if eid in seen:
+                continue
+            warm.append(eid)
+            seen.add(eid)
+            if len(warm) >= remaining:
+                break
+
+        return base + warm
+
     def run_one_day(self, day_index: int) -> Dict[str, object]:
         rng = random.Random(self.seed + day_index)
         games_today = rng.sample(self.games, k=min(self.cfg.games_per_day, len(self.games)))
-        if self.cfg.games_per_day > len(self.games):
-            print(f"[DayNightTrainer] games_per_day={self.cfg.games_per_day} but only len(games)={len(self.games)}. Sampling len(games) instead.")
+
+        # Start-of-day: ensure the warm DRAM set is materialized, and prefetch the base set to GPU.
+        if getattr(self, 'warm_experts', None) and self.cfg.enable_nvme_tier:
+            self.expert_store.ensure_on_cpu(self.warm_experts)
+            self.target_store.ensure_on_cpu(self.warm_experts)
+
+        if getattr(self, 'base_experts', None):
+            self.expert_store.prefetch_to_gpu(self.base_experts)
+            self.target_store.prefetch_to_gpu(self.base_experts)
+
 
         day_summaries: Dict[str, DayStats] = {}
         for g in games_today:
@@ -626,34 +677,21 @@ class DayNightTrainer:
         # Flush sleep buffer at end of sleep cycle
         self.sleep_buffer.flush()
 
-        # Quick routing/caching diagnostics (helps catch router collapse early).
-        flagged_lists = [self.flagged_experts.get(g, []) for g in games_today]
-        flagged_union: Set[int] = set()
-        for lst in flagged_lists:
-            for x in lst:
-                flagged_union.add(int(x))
+        # End of night: write back dirty experts, retain a DRAM warm set across days, drop the rest to NVMe/meta.
+        if self.cfg.enable_nvme_tier and hasattr(self.expert_store, 'reset_after_night'):
+            dirty = set(getattr(self, '_dirty_since_night', set()))
+            # Pick warm set for the next day (capacity-limited).
+            warm_next = self._select_warm_set(games_today, day_summaries)
+            self.warm_experts = list(warm_next)
+            # Reset both stores. This will also write back dirty experts if provided.
+            self.expert_store.reset_after_night(retain_cpu_ids=warm_next, writeback_ids=dirty, clear_hbm=True)
+            self.target_store.reset_after_night(retain_cpu_ids=warm_next, writeback_ids=dirty, clear_hbm=True)
+            self._dirty_since_night.clear()
 
-        def _jaccard(a: Sequence[int], b: Sequence[int]) -> float:
-            sa, sb = set(int(x) for x in a), set(int(x) for x in b)
-            denom = len(sa | sb)
-            return float(len(sa & sb)) / float(denom) if denom > 0 else 0.0
 
-        jacs: List[float] = []
-        for i in range(len(flagged_lists)):
-            for j in range(i + 1, len(flagged_lists)):
-                jacs.append(_jaccard(flagged_lists[i], flagged_lists[j]))
-        flagged_jaccard_mean = float(np.mean(jacs)) if jacs else 0.0
-
-        nvme_reads_total_day = float(sum(day_summaries[g].store_stats.nvme_reads for g in games_today))
-        bytes_nvme_read_total_day = float(sum(day_summaries[g].store_stats.bytes_nvme_read for g in games_today))
         out: Dict[str, object] = {
             "day": int(day_index),
             "games_today": games_today,
-            "n_games_today": int(len(games_today)),
-            "flagged_experts_unique_today": int(len(flagged_union)),
-            "flagged_experts_jaccard_mean_today": float(flagged_jaccard_mean),
-            "nvme_reads_total_day": float(nvme_reads_total_day),
-            "bytes_nvme_read_total_day": float(bytes_nvme_read_total_day),
             "episode_returns": {g: day_summaries[g].episode_returns for g in games_today},
             "episode_return_last": {
                 g: (float(day_summaries[g].episode_returns[-1]) if day_summaries[g].episode_returns else 0.0)
@@ -664,10 +702,19 @@ class DayNightTrainer:
                 for g in games_today
             },
             "n_episodes": {g: int(len(day_summaries[g].episode_returns)) for g in games_today},
-            "day_cache": day_cache,
+            "day_cache": {
+                g: {
+                    "hbm_hit_rate": day_summaries[g].store_stats.hit_rate(),
+                    "stall_time_s": day_summaries[g].store_stats.stall_time_s,
+                    "nvme_reads": day_summaries[g].store_stats.nvme_reads,
+                    "nvme_writes": day_summaries[g].store_stats.nvme_writes,
+                }
+                for g in games_today
+            },
             "flagged_experts": {g: self.flagged_experts[g] for g in games_today},
             "sleep": sleep_metrics,
             "ewc_tasks": len(self.ewc.tasks),
+            "warm_dram_experts": list(getattr(self, 'warm_experts', [])),
         }
 
         # Save a lightweight checkpoint each day if run_dir is set
