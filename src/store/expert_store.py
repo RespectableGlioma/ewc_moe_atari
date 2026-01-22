@@ -75,6 +75,20 @@ def _module_device(module: nn.Module) -> torch.device:
     return p.device if p is not None else torch.device("cpu")
 
 
+
+
+def _safe_reset_parameters_(m: nn.Module) -> None:
+    """Best-effort reset_parameters() for module trees.
+
+    Many torch modules implement reset_parameters() (Linear/Conv/etc).
+    We swallow exceptions so custom modules without a stable reset don't break runs.
+    """
+    if hasattr(m, "reset_parameters"):
+        try:
+            m.reset_parameters()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
 class ExpertStore:
     """Pages experts across GPU (HBM), CPU (DRAM), and disk (NVMe).
 
@@ -499,6 +513,80 @@ class ExpertStore:
         for eid in ids:
             self._ensure_on_cpu(eid)
             self._save_to_disk(eid)
+
+
+    def reinit_expert(
+        self,
+        expert_id: int,
+        *,
+        seed: Optional[int] = None,
+        save_to_disk: bool = True,
+        move_to: str = "cpu",
+    ) -> None:
+        """Re-initialize an expert's weights (and optimizer state) in-place.
+
+        This supports a "spawn a new expert" workflow:
+        - Pick an (unused) expert_id
+        - Re-init its weights
+        - (Optionally) persist to disk
+        - Let the router start routing to it and train it during the next sleep phase.
+
+        Important correctness notes:
+        - If the expert is on the meta device, we materialize empty CPU tensors *without*
+          loading from disk. This allows creating brand-new experts even if no disk copy exists.
+        - Optimizer state (if enabled) is reset so you don't inherit momentum/Adam moments.
+        - This method does not mark the expert as dirty; the trainer should manage writeback_ids.
+        """
+        expert_id = int(expert_id)
+        move_to = str(move_to).lower().strip()
+        if move_to not in ("cpu", "gpu"):
+            raise ValueError(f"move_to must be 'cpu' or 'gpu' (got {move_to!r})")
+
+        # If meta, materialize empty on CPU without disk load.
+        if self._is_on_meta(expert_id):
+            self._remove_lru(self._hbm_lru, expert_id)
+            self._remove_lru(self._dram_lru, expert_id)
+            self.experts[expert_id] = self.experts[expert_id].to_empty(device="cpu")
+        else:
+            # Bring to CPU (may load from disk if needed).
+            self._ensure_on_cpu(expert_id)
+
+        e = self.experts[expert_id]
+
+        # Deterministic re-init if desired.
+        if seed is not None:
+            seed = int(seed)
+            cpu_state = torch.random.get_rng_state()
+            torch.manual_seed(seed)
+            e.apply(_safe_reset_parameters_)
+            torch.random.set_rng_state(cpu_state)
+        else:
+            e.apply(_safe_reset_parameters_)
+
+        # Pin CPU parameters if configured.
+        if self._can_pin:
+            for p in e.parameters():
+                if p.device.type == "cpu":
+                    try:
+                        p.data = p.data.pin_memory()
+                    except Exception:
+                        pass
+
+        # Reset optimizer state.
+        if self.create_expert_optimizer:
+            self._optims[expert_id] = torch.optim.Adam(e.parameters(), lr=self.expert_lr)
+
+        # Touch DRAM LRU bookkeeping and enforce caps.
+        self._touch_lru(self._dram_lru, expert_id)
+        self._evict_dram_if_needed()
+
+        # Persist the new initialization to disk.
+        if save_to_disk and self.enable_disk:
+            self._save_to_disk(expert_id)
+
+        # Optionally move to GPU.
+        if move_to == "gpu":
+            self._ensure_on_gpu(expert_id)
 
     def reset_after_night(
         self,
