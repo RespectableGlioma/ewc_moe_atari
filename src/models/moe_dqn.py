@@ -107,6 +107,8 @@ class MoEDQN(nn.Module):
         expert_store: Optional[ExpertStore] = None,
         top_k: int = 2,
         record_used_experts: Optional[Set[int]] = None,
+        allowed_experts: Optional[Sequence[int]] = None,
+        force_experts: Optional[Sequence[int]] = None,
     ) -> MoEOutput:
         """One-step forward.
 
@@ -121,6 +123,28 @@ class MoEDQN(nn.Module):
         logits, new_hidden = self.router(feats, hidden)
         gating_probs = F.softmax(logits / max(self.temperature, 1e-6), dim=-1)
 
+        # Optional expert allow-list: mask router distribution to a subset (then renormalize).
+        allowed_list: Optional[List[int]] = None
+        if allowed_experts is not None:
+            seen = set()
+            tmp: List[int] = []
+            for e in allowed_experts:
+                try:
+                    ei = int(e)
+                except Exception:
+                    continue
+                if 0 <= ei < self.num_experts and ei not in seen:
+                    seen.add(ei)
+                    tmp.append(ei)
+            allowed_list = tmp if len(tmp) > 0 else None
+
+        if allowed_list is not None:
+            mask = torch.zeros_like(gating_probs)
+            mask[:, allowed_list] = 1.0
+            gated = gating_probs * mask
+            denom = gated.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            gating_probs = gated / denom
+
         # Dense path (debug)
         if expert_store is None or top_k >= self.num_experts:
             q_all = torch.stack([expert(feats) for expert in self.experts], dim=1)  # (B, E, A)
@@ -128,32 +152,44 @@ class MoEDQN(nn.Module):
             return MoEOutput(q_values=q_values, gating_probs=gating_probs, hidden=new_hidden, topk_experts=None)
 
         K = int(max(1, min(top_k, self.num_experts)))
-        topk_vals, topk_idx = torch.topk(gating_probs, k=K, dim=-1)  # (B,K)
+        if allowed_list is not None:
+            K = int(max(1, min(K, len(allowed_list))))
+
+        # Optional forced experts: ensure specific ids are included in the sparse top-k set (useful for spawning).
+        force_list: List[int] = []
+        if force_experts is not None:
+            seen_f = set()
+            for e in force_experts:
+                try:
+                    ei = int(e)
+                except Exception:
+                    continue
+                if 0 <= ei < self.num_experts and ei not in seen_f:
+                    if allowed_list is not None and ei not in allowed_list:
+                        continue
+                    seen_f.add(ei)
+                    force_list.append(ei)
+
+        if len(force_list) == 0:
+            topk_vals, topk_idx = torch.topk(gating_probs, k=K, dim=-1)  # (B,K)
+        else:
+            B = gating_probs.shape[0]
+            force_list = force_list[:K]
+            Fk = len(force_list)
+            force_idx = torch.tensor(force_list, device=gating_probs.device, dtype=torch.long).unsqueeze(0).expand(B, -1)
+            if Fk == K:
+                topk_idx = force_idx
+            else:
+                masked = gating_probs.clone()
+                masked[:, force_list] = -1.0
+                _, rest_idx = torch.topk(masked, k=K - Fk, dim=-1)
+                topk_idx = torch.cat([force_idx, rest_idx], dim=-1)
+            topk_vals = gating_probs.gather(1, topk_idx)
+
         uniq_experts = torch.unique(topk_idx).tolist()
 
-        # IMPORTANT:
-        # In a real out-of-core configuration, the number of unique experts used
-        # in a batch (len(uniq_experts)) can easily exceed the HBM capacity.
-        #
-        # If we attempt to "ensure all" experts are on GPU at once, the store
-        # will necessarily evict some (LRU), and then we'd later try to execute
-        # an evicted (CPU) expert on CUDA activations -> device mismatch.
-        #
-        # To keep correctness regardless of cache capacity, we use a hybrid:
-        #   - If the working set fits in HBM, prefetch all at once.
-        #   - Otherwise, page experts just-in-time inside the per-expert loop.
-        #
-        # This is slower than an overlapped/pipelined scheme, but it is a
-        # correctness-first baseline that makes the paging behavior explicit.
-        try:
-            hbm_cap = int(getattr(expert_store, "hbm_capacity", 0))
-        except Exception:
-            hbm_cap = 0
-
-        prefetched_all = False
-        if hbm_cap > 0 and len(uniq_experts) <= hbm_cap:
-            expert_store.ensure_on_gpu(uniq_experts)
-            prefetched_all = True
+        # Page experts to GPU (HBM) as needed
+        expert_store.ensure_on_gpu(uniq_experts)
 
         if record_used_experts is not None:
             for e in uniq_experts:
@@ -165,12 +201,6 @@ class MoEDQN(nn.Module):
         # Compute only used experts
         for e in uniq_experts:
             e = int(e)
-
-            # If we didn't prefetch the whole working set (e.g., too many unique
-            # experts for the HBM capacity), ensure this expert is resident now.
-            if not prefetched_all:
-                expert_store.ensure_on_gpu([e])
-
             mask = (topk_idx == e)  # (B,K)
             if not mask.any():
                 continue

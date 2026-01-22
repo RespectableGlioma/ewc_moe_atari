@@ -89,6 +89,22 @@ def _safe_reset_parameters_(m: nn.Module) -> None:
         except Exception:
             pass
 
+
+def _estimate_tensor_nbytes(t: torch.Tensor) -> int:
+    try:
+        return int(t.numel()) * int(t.element_size())
+    except Exception:
+        return 0
+
+def _estimate_payload_nbytes(obj: Any) -> int:
+    """Best-effort estimate of bytes in a (potentially nested) torch.save payload."""
+    if torch.is_tensor(obj):
+        return _estimate_tensor_nbytes(obj)
+    if isinstance(obj, dict):
+        return sum(_estimate_payload_nbytes(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_estimate_payload_nbytes(v) for v in obj)
+    return 0
 class ExpertStore:
     """Pages experts across GPU (HBM), CPU (DRAM), and disk (NVMe).
 
@@ -237,6 +253,9 @@ class ExpertStore:
             nbytes = 0
 
         self.stats.nvme_writes += 1
+        if nbytes <= 0:
+            # Some filesystems can fail path.stat(); fall back to payload size estimate.
+            nbytes = _estimate_payload_nbytes(payload)
         self.stats.bytes_nvme_write += int(nbytes)
         self.stats.stall_time_s += float(dt)
 
@@ -256,6 +275,9 @@ class ExpertStore:
             nbytes = 0
 
         self.stats.nvme_reads += 1
+        if nbytes <= 0:
+            # Some filesystems (e.g., certain network mounts) can fail path.stat(); fall back to payload size.
+            nbytes = _estimate_payload_nbytes(payload)
         self.stats.bytes_nvme_read += int(nbytes)
         self.stats.stall_time_s += float(dt)
 

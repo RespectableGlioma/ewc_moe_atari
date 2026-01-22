@@ -150,6 +150,10 @@ class DayNightTrainer:
 
         # Per-game performance tracking used to decide whether to spawn a new expert.
         self._game_best_return: Dict[str, float] = {}
+
+        # Optional: force newly spawned experts into the router's sparse top-k for a few sleep updates.
+        self._force_experts: Dict[str, List[int]] = {}
+        self._force_steps_remaining: Dict[str, int] = {}
         self._game_no_improve_days: Dict[str, int] = {}
         self._game_seen_days: Dict[str, int] = {}
 
@@ -314,8 +318,28 @@ class DayNightTrainer:
         return float(td_err), float(surprisal)
 
     @torch.no_grad()
-    def _target_q_next(self, next_obs_t: torch.Tensor, hidden_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        out_next = self.target_model(next_obs_t, hidden_t, expert_store=self.target_store, top_k=self.cfg.expert_top_k)
+    def _target_q_next(
+        self,
+        next_obs_t: torch.Tensor,
+        hidden_t: torch.Tensor,
+        *,
+        allowed_experts: Optional[Sequence[int]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        try:
+            out_next = self.target_model(
+                next_obs_t,
+                hidden_t,
+                expert_store=self.target_store,
+                top_k=self.cfg.expert_top_k,
+                allowed_experts=allowed_experts,
+            )
+        except TypeError:
+            out_next = self.target_model(
+                next_obs_t,
+                hidden_t,
+                expert_store=self.target_store,
+                top_k=self.cfg.expert_top_k,
+            )
         return out_next.q_values, out_next.hidden
 
     # ------------------------ learning (sleep) ------------------------
@@ -326,6 +350,8 @@ class DayNightTrainer:
         *,
         used_experts: Set[int],
         router_target_ids: Optional[Sequence[int]] = None,
+        force_experts: Optional[Sequence[int]] = None,
+        allowed_experts: Optional[Sequence[int]] = None,
         include_ewc: bool = True,
         include_results_aux: bool = True,
     ) -> torch.Tensor:
@@ -351,8 +377,7 @@ class DayNightTrainer:
         B, T = actions.shape
 
         # Results-regularized router aux loss hyperparams (safe defaults if not in cfg).
-        results_coef = float(getattr(self.cfg, "router_results_coef", getattr(self.cfg, "router_results_weight", 0.05)))
-        td_scale = float(getattr(self.cfg, "router_results_td_scale", 1.0))
+        results_coef = float(getattr(self.cfg, "router_results_coef", getattr(self.cfg, "router_results_weight", 0.10)))
         td_scale = max(td_scale, 1e-6)
 
         aux_router = torch.zeros((), device=obs.device)
@@ -376,13 +401,24 @@ class DayNightTrainer:
                 target_idx = torch.as_tensor(uniq, device=obs.device, dtype=torch.long)
 
         for t in range(T):
-            out = self.model(
-                obs[:, t],
-                hidden,
-                expert_store=self.expert_store,
-                top_k=self.cfg.expert_top_k,
-                record_used_experts=used_experts,
-            )
+            try:
+                out = self.model(
+                    obs[:, t],
+                    hidden,
+                    expert_store=self.expert_store,
+                    top_k=self.cfg.expert_top_k,
+                    record_used_experts=used_experts,
+                    allowed_experts=allowed_experts,
+                    force_experts=force_experts,
+                )
+            except TypeError:
+                out = self.model(
+                    obs[:, t],
+                    hidden,
+                    expert_store=self.expert_store,
+                    top_k=self.cfg.expert_top_k,
+                    record_used_experts=used_experts,
+                )
             q = out.q_values
             hidden = out.hidden
 
@@ -394,7 +430,7 @@ class DayNightTrainer:
             q_sa = q.gather(1, a_t).squeeze(1)
 
             with torch.no_grad():
-                q_next, _ = self._target_q_next(next_obs[:, t], hidden)
+                q_next, _ = self._target_q_next(next_obs[:, t], hidden, allowed_experts=allowed_experts)
                 max_next = q_next.max(dim=-1).values
                 target = rewards[:, t] + (1.0 - dones[:, t]) * self.cfg.gamma * max_next
 
@@ -420,10 +456,9 @@ class DayNightTrainer:
                     logp = (g.clamp_min(eps)).log()  # (B, E)
                     # Per-sample NLL of the "assigned" expert set (uniform target over that set).
                     nll = -logp.index_select(dim=1, index=idx).mean(dim=1)  # (B,)
+                    aux_router = aux_router + nll.mean()
 
-                    # Weight: smaller |TD| => larger weight (stickiness), larger |TD| => smaller weight (flexible).
-                    td_w = 1.0 / (1.0 + (td.abs().detach() / td_scale))
-                    aux_router = aux_router + (td_w * nll).mean()
+                    # Stickiness loss for the router (uniform target over the assigned expert set).
                     aux_n += 1
 
         # Add results-regularized router term (average over time steps).
@@ -617,6 +652,18 @@ class DayNightTrainer:
 
                 used_experts: Set[int] = set()
 
+                # Optional: restrict router to a per-game allow-list (base + flagged).
+                allowed_experts = None
+                if bool(getattr(self.cfg, "restrict_router_to_flagged", False)) and flagged:
+                    # keep order, unique
+                    allowed_experts = list(dict.fromkeys(list(self.base_experts) + list(flagged)))
+
+                # Optional: temporarily force a newly spawned expert into the sparse top-k so it gets trained.
+                force_experts = None
+                _force_left = int(self._force_steps_remaining.get(game_id, 0))
+                if _force_left > 0:
+                    force_experts = self._force_experts.get(game_id, None)
+
                 # Pin experts used in this step so they can't be evicted mid-backward.
                 if hasattr(self.expert_store, 'begin_step'):
                     self.expert_store.begin_step()
@@ -626,7 +673,13 @@ class DayNightTrainer:
                     # Best-effort zero for experts currently on GPU; more precise would require tracking.
                     self.expert_store.zero_grad(self.expert_store.experts_on_gpu())
     
-                    loss = self._loss_on_sequence_batch(batch, used_experts=used_experts, router_target_ids=flagged)
+                    loss = self._loss_on_sequence_batch(
+                        batch,
+                        used_experts=used_experts,
+                        router_target_ids=flagged,
+                        force_experts=force_experts,
+                        allowed_experts=allowed_experts,
+                    )
                     loss.backward()
     
                     # Clip grads
@@ -643,6 +696,14 @@ class DayNightTrainer:
                     used_counts.append(len(used_experts))
     
                     updates += 1
+                    # Decrement force counter (if any) after each update
+                    if _force_left > 0:
+                        _force_left -= 1
+                        if _force_left <= 0:
+                            self._force_steps_remaining.pop(game_id, None)
+                            self._force_experts.pop(game_id, None)
+                        else:
+                            self._force_steps_remaining[game_id] = _force_left
                     losses.append(float(loss.detach().cpu().item()))
     
                     if updates % self.cfg.target_update_interval == 0:
@@ -912,6 +973,12 @@ class DayNightTrainer:
                 self.expert_store.reinit_expert(new_id, seed=seed, save_to_disk=True, move_to="cpu")
             if hasattr(self.target_store, "reinit_expert"):
                 self.target_store.reinit_expert(new_id, seed=seed, save_to_disk=True, move_to="cpu")
+
+                # Force the newly spawned expert into the router's sparse top-k for a short period so it gets trained.
+                force_steps = int(getattr(self.cfg, "spawn_force_sleep_steps", 50))
+                if force_steps > 0:
+                    self._force_experts[g] = [int(new_id)]
+                    self._force_steps_remaining[g] = force_steps
 
             # Replace the lowest-scoring expert in this game's current set.
             cur = list(self.flagged_experts.get(g, []))
