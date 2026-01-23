@@ -887,31 +887,75 @@ class DayNightTrainer:
         best_i = min(candidates, key=lambda i: float(scores[int(i)]))
         return int(best_i)
 
+    
     def _init_expert_set_for_game(self, game_id: str) -> List[int]:
-        """Initialize a per-game expert set (flagged_experts) the first time we see a game.
+        """Initialize a per-game expert set the first time we see a game.
 
-        We deliberately avoid including the always-warm base experts in this set; those are global/shared.
+        Design intent:
+        - Do **not** pre-partition experts by game/task.
+        - Let the shared router/backbone predict which experts to call from context.
+        - After the day phase, we *consolidate* a game's expert set from the experts that
+          were actually used/credited during that day.
+
+        Therefore the default initial assignment is empty.
         """
-        k = int(self.cfg.top_experts_per_game)
-        out: List[int] = []
-        for _ in range(k):
-            eid = self._alloc_new_expert_id()
-            if eid is None:
-                # As a last resort, sample from the full id space (excluding base experts).
-                base = set(getattr(self, "base_experts", []))
-                choices = [i for i in range(int(self.cfg.num_experts)) if i not in base]
-                if not choices:
-                    break
-                eid = int(random.choice(choices))
-            out.append(int(eid))
-        # Ensure uniqueness (keep order)
-        uniq: List[int] = []
+        return []
+
+
+
+    def _consolidate_flagged_experts_from_day(
+        self,
+        game_id: str,
+        stats: DayStats,
+        top_ids: Sequence[int],
+    ) -> List[int]:
+        """Update a game's `flagged_experts` after the day rollouts.
+
+        We want *learned* routing rather than fixed partitions. So we:
+        - take today's top-used experts (salience-weighted credit)
+        - optionally blend with last day's flagged set to reduce churn
+        - store the resulting set as `flagged_experts[game_id]` which is then:
+            * prefetched during future days
+            * used as the router's "results-regularized" target during sleep
+            * used by EWC to decide which expert params to protect
+        """
+        topk = int(self.cfg.top_experts_per_game)
+        prev = [int(x) for x in self.flagged_experts.get(game_id, [])]
+        top = [int(x) for x in list(top_ids)]
+
+        # Candidate pool = prev ∪ top (preserve order).
+        candidates: List[int] = []
         seen: Set[int] = set()
-        for i in out:
-            if i not in seen:
-                uniq.append(int(i))
-                seen.add(int(i))
-        return uniq
+        for eid in prev + top:
+            eid = int(eid)
+            if eid not in seen:
+                candidates.append(eid)
+                seen.add(eid)
+
+        if not candidates or topk <= 0:
+            self.flagged_experts[game_id] = []
+            return []
+
+        scores = np.asarray(stats.expert_scores, dtype=np.float32)
+
+        # Stickiness bonus (scaled to score magnitude so it's roughly dimensionless).
+        stick = float(getattr(self.cfg, "router_assignment_stickiness", getattr(self.cfg, "flagged_stickiness", 0.05)))
+        stick = float(max(stick, 0.0))
+        bonus = stick * float(np.max(np.abs(scores)) + 1e-6)
+
+        prev_set = set(prev)
+
+        def score_of(eid: int) -> float:
+            s = float(scores[eid]) if 0 <= eid < int(scores.shape[0]) else 0.0
+            if eid in prev_set:
+                s += bonus
+            return s
+
+        ranked = sorted(candidates, key=score_of, reverse=True)
+        out = [int(e) for e in ranked[:topk]]
+        self.flagged_experts[game_id] = out
+        return out
+
 
     def _maybe_spawn_new_experts(
         self,
@@ -984,18 +1028,20 @@ class DayNightTrainer:
             if hasattr(self.target_store, "reinit_expert"):
                 self.target_store.reinit_expert(new_id, seed=seed, save_to_disk=True, move_to="cpu")
 
-                # Force the newly spawned expert into the router's sparse top-k for a short period so it gets trained.
-                force_steps = int(getattr(self.cfg, "spawn_force_sleep_steps", 50))
-                if force_steps > 0:
-                    self._force_experts[g] = [int(new_id)]
-                    self._force_steps_remaining[g] = force_steps
+            # Force the newly spawned expert into the router's sparse top-k for a short period so it gets trained.
+            force_steps = int(getattr(self.cfg, "spawn_force_sleep_steps", 50))
+            if force_steps > 0:
+                self._force_experts[g] = [int(new_id)]
+                self._force_steps_remaining[g] = force_steps
+
 
             # Replace the lowest-scoring expert in this game's current set.
+            scores = day_summaries[g].expert_scores
             cur = list(self.flagged_experts.get(g, []))
             if not cur:
-                cur = self._init_expert_set_for_game(g)
-
-            scores = day_summaries[g].expert_scores
+                # Fall back to today's top-used experts (or at least something) before adding the new expert.
+                top_ids = np.argsort(-scores)[:max(1, topk)].tolist()
+                cur = [int(i) for i in top_ids]
             if len(cur) < topk:
                 cur.append(int(new_id))
             else:
@@ -1057,6 +1103,11 @@ class DayNightTrainer:
                 topk = int(self.cfg.top_experts_per_game)
                 top_ids = np.argsort(-stats.expert_scores)[:topk].tolist()
                 day_top_used[g] = [int(i) for i in top_ids]
+
+                # Consolidate a per-game expert set from today's *actual* usage.
+                # This avoids hard-coding a disjoint expert partition by game.
+                self._consolidate_flagged_experts_from_day(g, stats, day_top_used[g])
+
 
             # Before sleep: decide whether any games should "spawn" a fresh expert.
             spawned = self._maybe_spawn_new_experts(day_index=day_index, games_today=games_today, day_summaries=day_summaries)

@@ -75,36 +75,6 @@ def _module_device(module: nn.Module) -> torch.device:
     return p.device if p is not None else torch.device("cpu")
 
 
-
-
-def _safe_reset_parameters_(m: nn.Module) -> None:
-    """Best-effort reset_parameters() for module trees.
-
-    Many torch modules implement reset_parameters() (Linear/Conv/etc).
-    We swallow exceptions so custom modules without a stable reset don't break runs.
-    """
-    if hasattr(m, "reset_parameters"):
-        try:
-            m.reset_parameters()  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-
-def _estimate_tensor_nbytes(t: torch.Tensor) -> int:
-    try:
-        return int(t.numel()) * int(t.element_size())
-    except Exception:
-        return 0
-
-def _estimate_payload_nbytes(obj: Any) -> int:
-    """Best-effort estimate of bytes in a (potentially nested) torch.save payload."""
-    if torch.is_tensor(obj):
-        return _estimate_tensor_nbytes(obj)
-    if isinstance(obj, dict):
-        return sum(_estimate_payload_nbytes(v) for v in obj.values())
-    if isinstance(obj, (list, tuple)):
-        return sum(_estimate_payload_nbytes(v) for v in obj)
-    return 0
 class ExpertStore:
     """Pages experts across GPU (HBM), CPU (DRAM), and disk (NVMe).
 
@@ -253,9 +223,6 @@ class ExpertStore:
             nbytes = 0
 
         self.stats.nvme_writes += 1
-        if nbytes <= 0:
-            # Some filesystems can fail path.stat(); fall back to payload size estimate.
-            nbytes = _estimate_payload_nbytes(payload)
         self.stats.bytes_nvme_write += int(nbytes)
         self.stats.stall_time_s += float(dt)
 
@@ -275,9 +242,6 @@ class ExpertStore:
             nbytes = 0
 
         self.stats.nvme_reads += 1
-        if nbytes <= 0:
-            # Some filesystems (e.g., certain network mounts) can fail path.stat(); fall back to payload size.
-            nbytes = _estimate_payload_nbytes(payload)
         self.stats.bytes_nvme_read += int(nbytes)
         self.stats.stall_time_s += float(dt)
 
@@ -527,6 +491,127 @@ class ExpertStore:
     def experts_on_cpu(self) -> List[int]:
         return list(self._dram_lru)
 
+
+    def reinit_expert(
+        self,
+        expert_id: int,
+        *,
+        seed: Optional[int] = None,
+        save_to_disk: bool = False,
+        move_to: str = "cpu",
+    ) -> None:
+        """Re-initialize an expert's weights (and optimizer state).
+
+        This is used by "spawn a new expert" style algorithms: you want a fresh expert slot
+        without needing to grow `num_experts`.
+
+        Notes:
+        - If the expert currently lives on the meta device, we materialize it via `to_empty()`
+          on the init device before resetting parameters.
+        - If `save_to_disk=True`, we persist the fresh weights/optim state immediately so
+          later drops to meta are safe.
+        """
+        expert_id = int(expert_id)
+
+        # Deterministic-ish init when desired.
+        if seed is not None:
+            seed = int(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+
+        # Where do we want the expert to live after reinit?
+        move_to = str(move_to).lower()
+        if move_to in ("gpu", "cuda"):
+            target = self.device
+        elif move_to in ("cpu",):
+            target = torch.device("cpu")
+        elif move_to in ("meta",):
+            target = torch.device("meta")
+        else:
+            # Allow a fully-qualified device string (e.g., "cuda:0"), else fall back to CPU.
+            try:
+                target = torch.device(move_to)
+            except Exception:
+                target = torch.device("cpu")
+
+        # You cannot initialize parameters on meta; materialize on CPU first, then (optionally) move.
+        init_dev = torch.device("cpu") if target.type == "meta" else target
+
+        # Remove from LRUs (we will re-touch below).
+        self._remove_lru(self._hbm_lru, expert_id)
+        self._remove_lru(self._dram_lru, expert_id)
+
+        e = self.experts[expert_id]
+
+        # Materialize on init_dev.
+        if init_dev.type == "cpu":
+            if self._is_on_meta(expert_id):
+                e = e.to_empty(device="cpu")
+            else:
+                e = e.to("cpu")
+        else:
+            if self._is_on_meta(expert_id):
+                e = e.to_empty(device=init_dev)
+            else:
+                e = e.to(init_dev)
+
+        # Reset parameters for all submodules that support it.
+        def _reset(m: nn.Module) -> None:
+            if hasattr(m, "reset_parameters"):
+                try:
+                    m.reset_parameters()
+                except Exception:
+                    pass
+
+        with torch.no_grad():
+            e.apply(_reset)
+
+        # Replace the module reference (defensive; .to() returns the same object in-place, but keep it explicit).
+        self.experts[expert_id] = e
+
+        # (Re)create optimizer state for this expert.
+        if expert_id in self._optims:
+            del self._optims[expert_id]
+        if self.create_expert_optimizer:
+            self._optims[expert_id] = torch.optim.Adam(e.parameters(), lr=self.expert_lr)
+            _move_optimizer_state_(self._optims[expert_id], init_dev)
+
+        # Pin CPU tensors if requested.
+        if init_dev.type == "cpu" and self._can_pin:
+            for p in e.parameters():
+                if p.device.type == "cpu":
+                    p.data = p.data.pin_memory()
+
+        # Optionally persist immediately (so later drops-to-meta are safe).
+        if save_to_disk and self.enable_disk:
+            self._save_to_disk(expert_id)
+
+        # Move to final tier if needed.
+        if target.type == "meta":
+            # Drop to meta (free memory). Optim state is dropped too.
+            self._remove_lru(self._hbm_lru, expert_id)
+            self._remove_lru(self._dram_lru, expert_id)
+            if expert_id in self._optims:
+                del self._optims[expert_id]
+            self.experts[expert_id].to("meta")
+            return
+
+        if target.type == "cuda" and init_dev.type != "cuda":
+            # Non-blocking move to GPU (counting bytes/timing as a stall).
+            self._ensure_on_gpu(expert_id)
+        elif target.type == "cpu" and init_dev.type != "cpu":
+            self._ensure_on_cpu(expert_id)
+
+        # Touch appropriate LRU and enforce budgets.
+        if self._is_on_gpu(expert_id):
+            self._touch_lru(self._hbm_lru, expert_id)
+            self._evict_hbm_if_needed(protect=set([expert_id]))
+        else:
+            self._touch_lru(self._dram_lru, expert_id)
+            self._evict_dram_if_needed()
+
+
     def save_experts_to_disk(self, expert_ids: Iterable[int]) -> None:
         """Persist selected experts to disk (weights + optimizer state if enabled)."""
         if not self.enable_disk:
@@ -535,80 +620,6 @@ class ExpertStore:
         for eid in ids:
             self._ensure_on_cpu(eid)
             self._save_to_disk(eid)
-
-
-    def reinit_expert(
-        self,
-        expert_id: int,
-        *,
-        seed: Optional[int] = None,
-        save_to_disk: bool = True,
-        move_to: str = "cpu",
-    ) -> None:
-        """Re-initialize an expert's weights (and optimizer state) in-place.
-
-        This supports a "spawn a new expert" workflow:
-        - Pick an (unused) expert_id
-        - Re-init its weights
-        - (Optionally) persist to disk
-        - Let the router start routing to it and train it during the next sleep phase.
-
-        Important correctness notes:
-        - If the expert is on the meta device, we materialize empty CPU tensors *without*
-          loading from disk. This allows creating brand-new experts even if no disk copy exists.
-        - Optimizer state (if enabled) is reset so you don't inherit momentum/Adam moments.
-        - This method does not mark the expert as dirty; the trainer should manage writeback_ids.
-        """
-        expert_id = int(expert_id)
-        move_to = str(move_to).lower().strip()
-        if move_to not in ("cpu", "gpu"):
-            raise ValueError(f"move_to must be 'cpu' or 'gpu' (got {move_to!r})")
-
-        # If meta, materialize empty on CPU without disk load.
-        if self._is_on_meta(expert_id):
-            self._remove_lru(self._hbm_lru, expert_id)
-            self._remove_lru(self._dram_lru, expert_id)
-            self.experts[expert_id] = self.experts[expert_id].to_empty(device="cpu")
-        else:
-            # Bring to CPU (may load from disk if needed).
-            self._ensure_on_cpu(expert_id)
-
-        e = self.experts[expert_id]
-
-        # Deterministic re-init if desired.
-        if seed is not None:
-            seed = int(seed)
-            cpu_state = torch.random.get_rng_state()
-            torch.manual_seed(seed)
-            e.apply(_safe_reset_parameters_)
-            torch.random.set_rng_state(cpu_state)
-        else:
-            e.apply(_safe_reset_parameters_)
-
-        # Pin CPU parameters if configured.
-        if self._can_pin:
-            for p in e.parameters():
-                if p.device.type == "cpu":
-                    try:
-                        p.data = p.data.pin_memory()
-                    except Exception:
-                        pass
-
-        # Reset optimizer state.
-        if self.create_expert_optimizer:
-            self._optims[expert_id] = torch.optim.Adam(e.parameters(), lr=self.expert_lr)
-
-        # Touch DRAM LRU bookkeeping and enforce caps.
-        self._touch_lru(self._dram_lru, expert_id)
-        self._evict_dram_if_needed()
-
-        # Persist the new initialization to disk.
-        if save_to_disk and self.enable_disk:
-            self._save_to_disk(expert_id)
-
-        # Optionally move to GPU.
-        if move_to == "gpu":
-            self._ensure_on_gpu(expert_id)
 
     def reset_after_night(
         self,
