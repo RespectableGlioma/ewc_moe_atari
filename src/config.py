@@ -15,6 +15,8 @@ class Config:
     expert_hidden_dim: int = 256
     feature_dim: int = 512
     expert_top_k: int = 2  # sparse top-k experts per step
+    load_balance_weight: float = 0.01
+    router_noise: float = 1.0
 
     # Expert Store (HBM/DRAM/NVMe)
     hbm_expert_capacity: int = 4          # how many experts may be resident on GPU

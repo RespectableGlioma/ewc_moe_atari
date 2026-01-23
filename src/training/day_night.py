@@ -65,6 +65,7 @@ class DayNightTrainer:
             expert_hidden_dim=self.cfg.expert_hidden_dim,
             feature_dim=self.cfg.feature_dim,
             temperature=1.0,
+            router_noise=self.cfg.router_noise,
         ).to(self.device)
 
         self.target_model = MoEDQN(
@@ -75,6 +76,7 @@ class DayNightTrainer:
             expert_hidden_dim=self.cfg.expert_hidden_dim,
             feature_dim=self.cfg.feature_dim,
             temperature=1.0,
+            router_noise=self.cfg.router_noise,
         ).to(self.device)
         self.target_model.load_state_dict(self.model.state_dict())
         self.target_model.eval()
@@ -441,6 +443,9 @@ class DayNightTrainer:
             w = w / (w.mean() + 1e-6)
 
             total_loss = total_loss + (w * huber).mean()
+
+            if out.aux_loss is not None:
+                total_loss = total_loss + self.cfg.load_balance_weight * out.aux_loss
 
             # Results-regularized router aux term: encourage probability mass on the assigned expert set,
             # with stronger pressure when TD-error is already low (i.e., stick with what works).

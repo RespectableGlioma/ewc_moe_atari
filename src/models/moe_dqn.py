@@ -59,6 +59,7 @@ class MoEOutput:
     gating_probs: torch.Tensor          # (B, num_experts)
     hidden: torch.Tensor                # (B, hidden_dim)
     topk_experts: Optional[torch.Tensor] = None  # (B, K)
+    aux_loss: Optional[torch.Tensor] = None  # Load balancing loss
 
 
 class MoEDQN(nn.Module):
@@ -79,6 +80,7 @@ class MoEDQN(nn.Module):
         expert_hidden_dim: int = 256,
         feature_dim: int = 512,
         temperature: float = 1.0,
+        router_noise: float = 1.0,
     ):
         super().__init__()
         self.obs_stack = int(obs_stack)
@@ -88,9 +90,15 @@ class MoEDQN(nn.Module):
         self.expert_hidden_dim = int(expert_hidden_dim)
         self.feature_dim = int(feature_dim)
         self.temperature = float(temperature)
+        self.router_noise = float(router_noise)
 
         self.encoder = ConvEncoder(in_channels=self.obs_stack, feature_dim=self.feature_dim)
-        self.router = RouterGRU(feature_dim=self.feature_dim, hidden_dim=self.router_hidden_dim, num_experts=self.num_experts)
+        self.router = RouterGRU(
+            feature_dim=self.feature_dim,
+            hidden_dim=self.router_hidden_dim,
+            num_experts=self.num_experts,
+            noise_std=self.router_noise,
+        )
         self.experts = nn.ModuleList([
             ExpertMLP(self.feature_dim, self.action_dim, hidden_dim=self.expert_hidden_dim)
             for _ in range(self.num_experts)
@@ -120,7 +128,7 @@ class MoEDQN(nn.Module):
             record_used_experts: optional set to be updated with expert ids used
         """
         feats = self.encoder(obs)
-        logits, new_hidden = self.router(feats, hidden)
+        logits, new_hidden = self.router(feats, hidden, training=self.training)
         gating_probs = F.softmax(logits / max(self.temperature, 1e-6), dim=-1)
 
         # Optional expert allow-list: mask router distribution to a subset (then renormalize).
@@ -186,6 +194,9 @@ class MoEDQN(nn.Module):
                 topk_idx = torch.cat([force_idx, rest_idx], dim=-1)
             topk_vals = gating_probs.gather(1, topk_idx)
 
+        # Compute load balancing loss
+        aux_loss = self.router.compute_load_balancing_loss(gating_probs, topk_idx)
+
         uniq_experts = torch.unique(topk_idx).tolist()
 
         # Page experts to GPU (HBM) as needed
@@ -211,4 +222,4 @@ class MoEDQN(nn.Module):
             q_e = self.experts[e](feats.index_select(0, idx))
             q_values.index_add_(0, idx, q_e * w.index_select(0, idx).unsqueeze(1))
 
-        return MoEOutput(q_values=q_values, gating_probs=gating_probs, hidden=new_hidden, topk_experts=topk_idx)
+        return MoEOutput(q_values=q_values, gating_probs=gating_probs, hidden=new_hidden, topk_experts=topk_idx, aux_loss=aux_loss)
