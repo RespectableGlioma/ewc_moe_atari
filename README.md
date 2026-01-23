@@ -1,5 +1,9 @@
 # EWC + MoE Router (RNN) for Multi-Atari Day/Night Training (Gymnasium)
 
+```bash
+git clone https://github.com/RespectableGlioma/ewc_moe_atari.git
+```
+
 This is a **research scaffold** you can run in **Google Colab** to test the idea:
 
 - **Day (acting):** play a small set of Atari games sequentially (correlated stream), collect trajectories and salience.
