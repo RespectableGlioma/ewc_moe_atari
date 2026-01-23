@@ -377,7 +377,12 @@ class DayNightTrainer:
         B, T = actions.shape
 
         # Results-regularized router aux loss hyperparams (safe defaults if not in cfg).
+        #
+        # NOTE: This aux term is intentionally *results-shaped* ("stick with what works") rather
+        # than generic entropy/load-balance pressure.
         results_coef = float(getattr(self.cfg, "router_results_coef", getattr(self.cfg, "router_results_weight", 0.10)))
+        # Scale for TD-error -> stickiness weighting. Larger => router sticks more even when TD is high.
+        td_scale = float(getattr(self.cfg, "router_results_td_scale", 1.0))
         td_scale = max(td_scale, 1e-6)
 
         aux_router = torch.zeros((), device=obs.device)
@@ -456,7 +461,12 @@ class DayNightTrainer:
                     logp = (g.clamp_min(eps)).log()  # (B, E)
                     # Per-sample NLL of the "assigned" expert set (uniform target over that set).
                     nll = -logp.index_select(dim=1, index=idx).mean(dim=1)  # (B,)
-                    aux_router = aux_router + nll.mean()
+
+                    # Results shaping: make the router *more sticky* when TD-error is already small.
+                    # When TD-error is large, we reduce this pressure so the router can explore / switch.
+                    td_abs = td.detach().abs()  # (B,)
+                    sticky_w = torch.exp(-td_abs / td_scale).clamp(0.0, 1.0)  # (B,)
+                    aux_router = aux_router + (sticky_w * nll).mean()
 
                     # Stickiness loss for the router (uniform target over the assigned expert set).
                     aux_n += 1
