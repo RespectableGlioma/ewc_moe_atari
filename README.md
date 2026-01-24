@@ -146,11 +146,7 @@ Recommended:
 pip install "gymnasium[atari]"
 ```
 
-Or, using the provided file:
-
-```bash
-pip install -r requirements_atari.txt
-```
+If you prefer, you can also install `gymnasium[atari]` plus your preferred PyTorch build manually.
 
 ### Run the Atari demo
 
@@ -188,3 +184,66 @@ Notes:
 - If you want a learnable in-core encoder anyway, add `--encoder conv`.
 
 If you tell me your target environment (A100/H100? PCIe vs NVLink? local NVMe?), we can evolve the prototype toward something closer to a real training system.
+
+---
+
+## Colab persistence (Google Drive)
+
+Colab VMs are ephemeral, so if you want runs to survive a runtime reset, write outputs to Google Drive.
+
+### 1) Mount Google Drive
+
+Run this once in a notebook cell:
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+Then make an output directory:
+
+```bash
+mkdir -p /content/drive/MyDrive/Colab_Notebooks/ooc_moe_runs
+```
+
+### 2) Run with --run_dir
+
+Both `train.py` and `train_ale.py` accept `--run_dir`. When it is set:
+
+- Metrics are appended to `metrics.jsonl`
+- `config.json` is written once
+- Periodic checkpoints are written to `checkpoint_last.pt`
+- `stats_latest.json` / `stats_final.json` are written
+
+If you **do not** pass `--disk_root`, it defaults to `--run_dir/disk`, so expert weights + optimizer state are also persisted.
+
+Example:
+
+```bash
+RUN_DIR=/content/drive/MyDrive/Colab_Notebooks/ooc_moe_runs/ale_run1
+
+python train_ale.py \
+  --run_dir $RUN_DIR \
+  --checkpoint_every 20 \
+  --writeback_policy periodic --writeback_every 20 \
+  --n_experts 512 --n_envs 512 \
+  --gpu_slots 16 --cpu_cache 64 \
+  --games Pong,Breakout,SpaceInvaders,Seaquest \
+  --env_backend ale_vec --vec_envs_per_game 8 \
+  --batch_size 512 --steps 200 \
+  --lr 1e-2 --optim adamw \
+  --prefetch --prefetch_gpu --io_workers 4 \
+  --sort_by_expert
+```
+
+### 3) Resume after a restart
+
+Re-run with the same `--run_dir` and add `--resume`. Do **not** use `--reset_disk` when resuming.
+
+```bash
+python train_ale.py --run_dir $RUN_DIR --resume --steps 400
+```
+
+### Notes on performance
+
+Writing the cold store (`disk_root`) to Google Drive is slower than local NVMe. For fast iteration, keep a nonzero `--cpu_cache` so disk traffic is small.

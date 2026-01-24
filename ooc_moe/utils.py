@@ -65,6 +65,16 @@ class Stats:
                 lines.append(f"{k}: {v:.3f} s")
         return "\n".join(lines)
 
+    def to_dict(self) -> Dict[str, Dict[str, float] | Dict[str, int]]:
+        """Serialize stats for JSON logging."""
+        # Copy under lock to avoid partial reads.
+        with self._lock:
+            return {
+                "counters": dict(self.counters),
+                "timers": dict(self.timers),
+                "bytes_moved": dict(self.bytes_moved),
+            }
+
 
 class LRUCache(Generic[K, V]):
     """

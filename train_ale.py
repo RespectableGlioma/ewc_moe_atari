@@ -5,6 +5,7 @@ import argparse
 import shutil
 import time
 from pathlib import Path
+import json
 from typing import Optional
 
 import numpy as np
@@ -17,6 +18,7 @@ from ooc_moe.moe import moe_forward_top1, route_fixed_by_env
 from ooc_moe.synthetic import EnvEpisodeSampler, EnvMarkovSampler, SyntheticEnvTeacher
 from ooc_moe.tiered_store import LatencySim, TieredExpertStore
 from ooc_moe.utils import Stats
+from ooc_moe.persist import JsonlLogger, atomic_torch_save, atomic_write_json, is_colab, mount_gdrive
 
 
 def parse_dtype(s: str) -> torch.dtype:
@@ -148,6 +150,26 @@ def main() -> None:
 
     ap.add_argument("--no_tqdm", action="store_true")
 
+    # --- Persistence (useful in Colab) ---
+    ap.add_argument(
+        "--run_dir",
+        type=str,
+        default="",
+        help="If set, write metrics + checkpoints here (e.g. /content/drive/MyDrive/Colab_Notebooks/ooc_runs/ale_run1).",
+    )
+    ap.add_argument(
+        "--mount_drive",
+        action="store_true",
+        help="If running in Colab, attempt to mount Google Drive at /content/drive before using --run_dir.",
+    )
+    ap.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=0,
+        help="If >0, flush dirty expert state and save a checkpoint every N steps.",
+    )
+    ap.add_argument("--resume", action="store_true", help="Resume from --run_dir/checkpoint_last.pt")
+
     # --- Atari knobs ---
     ap.add_argument(
         "--games",
@@ -175,6 +197,19 @@ def main() -> None:
 
     args = ap.parse_args()
 
+    if args.mount_drive:
+        # Best-effort; in Colab you normally mount once in a notebook cell.
+        try:
+            mount_gdrive("/content/drive")
+        except Exception as e:
+            print(f"[warn] drive mount failed: {e}")
+
+    run_dir = Path(args.run_dir) if args.run_dir else None
+    if args.resume and run_dir is None:
+        raise ValueError("--resume requires --run_dir")
+    if run_dir is not None:
+        run_dir.mkdir(parents=True, exist_ok=True)
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -184,10 +219,20 @@ def main() -> None:
         device = torch.device(args.device)
 
     compute_dtype = parse_dtype(args.dtype)
-    disk_root = Path(args.disk_root) if args.disk_root else None
+    # If run_dir is provided and disk_root isn't, default the disk backing store to run_dir/disk
+    if args.disk_root:
+        disk_root = Path(args.disk_root)
+    elif run_dir is not None:
+        disk_root = run_dir / "disk"
+    else:
+        disk_root = None
     if disk_root is not None:
-        if args.reset_disk and disk_root.exists():
-            shutil.rmtree(disk_root, ignore_errors=True)
+        if args.resume:
+            # Don't destroy state when resuming.
+            pass
+        else:
+            if args.reset_disk and disk_root.exists():
+                shutil.rmtree(disk_root, ignore_errors=True)
         disk_root.mkdir(parents=True, exist_ok=True)
 
     stats = Stats()
@@ -284,8 +329,58 @@ def main() -> None:
     g = torch.Generator(device="cpu")
     g.manual_seed(args.seed + 2)
 
+    # --- Run logging / checkpointing ---
+    metrics_logger = None
+    start_step = 1
+    if run_dir is not None:
+        atomic_write_json(run_dir / "config.json", vars(args))
+        metrics_logger = JsonlLogger(run_dir / "metrics.jsonl")
+
+        if is_colab() and str(run_dir).startswith("/content/drive"):
+            if not Path("/content/drive/MyDrive").exists():
+                print(
+                    "[warn] run_dir is under /content/drive but Google Drive doesn't appear mounted. "
+                    "In a notebook cell run: from google.colab import drive; drive.mount('/content/drive')"
+                )
+
+        if args.resume:
+            ckpt_path = run_dir / "checkpoint_last.pt"
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"--resume set but checkpoint not found: {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            start_step = int(ckpt.get("step", 0)) + 1
+            if "torch_rng" in ckpt:
+                torch.set_rng_state(ckpt["torch_rng"])
+            if device.type == "cuda" and "cuda_rng" in ckpt:
+                try:
+                    torch.cuda.set_rng_state_all(ckpt["cuda_rng"])
+                except Exception:
+                    pass
+            if "numpy_rng" in ckpt and ckpt["numpy_rng"] is not None:
+                try:
+                    np.random.set_state(ckpt["numpy_rng"])
+                except Exception:
+                    pass
+            if "g_state" in ckpt and ckpt["g_state"] is not None:
+                g.set_state(ckpt["g_state"])
+            if "sampler_state" in ckpt and ckpt["sampler_state"] is not None:
+                try:
+                    sampler.load_state_dict(ckpt["sampler_state"])
+                except Exception:
+                    pass
+            if encoder is not None and "encoder_state" in ckpt and ckpt["encoder_state"] is not None:
+                try:
+                    encoder.load_state_dict(ckpt["encoder_state"])
+                except Exception:
+                    pass
+            if enc_optim is not None and "encoder_optim" in ckpt and ckpt["encoder_optim"] is not None:
+                try:
+                    enc_optim.load_state_dict(ckpt["encoder_optim"])
+                except Exception:
+                    pass
+
     tqdm = None if args.no_tqdm else _try_tqdm()
-    iterator = range(1, args.steps + 1) if tqdm is None else tqdm(range(1, args.steps + 1))
+    iterator = range(start_step, args.steps + 1) if tqdm is None else tqdm(range(start_step, args.steps + 1))
 
     def make_env_ids() -> torch.Tensor:
         envs = [sampler.next() for _ in range(args.envs_per_batch)]
@@ -408,12 +503,43 @@ def main() -> None:
             else:
                 iterator.set_description(msg)
 
+            if metrics_logger is not None:
+                metrics_logger.log(
+                    {
+                        "step": int(step),
+                        "loss": float(loss_val),
+                        "unique_experts": int(n_unique),
+                        "gpu_cache_size": int(len(store.gpu_map)),
+                        "cpu_cache_size": int(len(store.cpu_cache)),
+                        "frames": int(frames),
+                        "env0": int(cur_e0),
+                        "game": str(game_name),
+                    }
+                )
+
         # Shift lookahead and schedule prefetch.
         cur_env_ids, cur_expert_ids = next_env_ids, next_expert_ids
         next_env_ids = make_env_ids()
         next_expert_ids = route_fixed_by_env(next_env_ids, n_experts=args.n_experts)
         if args.prefetch:
             store.prefetch(torch.unique(next_expert_ids).tolist())
+
+        # Periodic checkpoint (flush dirty experts to disk then save a lightweight run checkpoint).
+        if run_dir is not None and args.checkpoint_every > 0 and (step % args.checkpoint_every == 0):
+            store.flush_dirty(sync=True)
+            ckpt = {
+                "step": int(step),
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
+                "numpy_rng": np.random.get_state(),
+                "g_state": g.get_state(),
+                "sampler_state": sampler.state_dict() if hasattr(sampler, "state_dict") else None,
+                "encoder_state": encoder.state_dict() if encoder is not None else None,
+                "encoder_optim": enc_optim.state_dict() if enc_optim is not None else None,
+                "stats": stats.to_dict(),
+            }
+            atomic_torch_save(run_dir / "checkpoint_last.pt", ckpt)
+            atomic_write_json(run_dir / "stats_latest.json", stats.to_dict())
 
     t_all = time.perf_counter() - t0_all
     if tqdm is not None:
@@ -424,6 +550,26 @@ def main() -> None:
     store.flush_all()
     print()
     print(stats.summary())
+
+    if run_dir is not None:
+        atomic_write_json(run_dir / "stats_final.json", stats.to_dict())
+        (run_dir / "stats_final.txt").write_text(stats.summary() + "\n")
+        # Final checkpoint (expert state is stored in disk_root; this captures seeds + encoder parameters).
+        ckpt = {
+            "step": int(args.steps),
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
+            "numpy_rng": np.random.get_state(),
+            "g_state": g.get_state(),
+            "sampler_state": sampler.state_dict() if hasattr(sampler, "state_dict") else None,
+            "encoder_state": encoder.state_dict() if encoder is not None else None,
+            "encoder_optim": enc_optim.state_dict() if enc_optim is not None else None,
+            "stats": stats.to_dict(),
+        }
+        atomic_torch_save(run_dir / "checkpoint_last.pt", ckpt)
+
+    if metrics_logger is not None:
+        metrics_logger.close()
 
 
 if __name__ == "__main__":

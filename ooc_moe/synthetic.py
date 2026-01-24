@@ -26,6 +26,25 @@ class EnvEpisodeSampler:
         self._t += 1
         return self._cur
 
+    def state_dict(self) -> dict:
+        return {
+            "type": "episode",
+            "n_envs": int(self.n_envs),
+            "episode_len": int(self.episode_len),
+            "t": int(self._t),
+            "cur": int(self._cur),
+            "g_state": self.g.get_state(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if state.get("type") != "episode":
+            raise ValueError(f"Expected episode state_dict, got {state.get('type')}")
+        self.n_envs = int(state["n_envs"])
+        self.episode_len = int(state["episode_len"])
+        self._t = int(state["t"])
+        self._cur = int(state["cur"])
+        self.g.set_state(state["g_state"])
+
 
 class EnvMarkovSampler:
     """
@@ -43,6 +62,23 @@ class EnvMarkovSampler:
         if u > self.p_stay:
             self._cur = int(torch.randint(0, self.n_envs, (1,), generator=self.g).item())
         return self._cur
+
+    def state_dict(self) -> dict:
+        return {
+            "type": "markov",
+            "n_envs": int(self.n_envs),
+            "p_stay": float(self.p_stay),
+            "cur": int(self._cur),
+            "g_state": self.g.get_state(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if state.get("type") != "markov":
+            raise ValueError(f"Expected markov state_dict, got {state.get('type')}")
+        self.n_envs = int(state["n_envs"])
+        self.p_stay = float(state["p_stay"])
+        self._cur = int(state["cur"])
+        self.g.set_state(state["g_state"])
 
 
 class SyntheticEnvTeacher:
