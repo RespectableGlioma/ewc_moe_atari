@@ -130,13 +130,21 @@ class AtariBatchSource:
 
         # One vector env per game.
         self.envs = []
+        self._obs_buf: Dict[int, np.ndarray] = {}
+        self._pending_send: set[int] = set()
         for gi, env_id in enumerate(self.env_ids):
             env = self._make_env(env_id, game_index=gi)
-            # Prime with a reset to have a valid internal state.
+
+            # Prime with a reset and capture the initial observation buffer.
             try:
-                env.reset(seed=self.seed + 17 * gi)
+                out = env.reset(seed=self.seed + 17 * gi)
             except TypeError:
-                env.reset()
+                out = env.reset()
+            if isinstance(out, tuple) and len(out) >= 1:
+                obs0 = out[0]
+            else:
+                obs0 = out
+            self._obs_buf[int(gi)] = np.asarray(obs0)
             self.envs.append(env)
 
         # Cached action metadata (best-effort).
@@ -239,6 +247,49 @@ class AtariBatchSource:
 
     def env_id_to_game_index(self, env_id: int) -> int:
         return int(env_id) % len(self.envs)
+
+    def current_obs(self, game_index: int) -> np.ndarray:
+        """Return the current observation buffer for a game (shape: (num_envs, ...))."""
+        return self._obs_buf[int(game_index)]
+
+    def sample_from_buffer(self, env_id: int, n: int) -> np.ndarray:
+        """Sample `n` stacked observations from the *current* buffer without stepping.
+
+        This enables pipelining: call `step_send(...)`, do compute, then `step_recv(...)`
+        to refresh buffers while overlapping with compute and I/O.
+        """
+        if n <= 0:
+            raise ValueError("n must be > 0")
+        gi = self.env_id_to_game_index(env_id)
+        buf = self._obs_buf[int(gi)]
+        num_envs = int(buf.shape[0])
+        idx = self.rng.integers(0, num_envs, size=(int(n),), dtype=np.int64)
+        return buf[idx]
+
+    def step_send(self, game_indices: Iterable[int]) -> None:
+        """Begin stepping a subset of games (best-effort async via ALE send/recv)."""
+        for gi in set(int(g) for g in game_indices):
+            env = self.envs[gi]
+            num_envs = int(getattr(env, "num_envs", self.cfg.num_envs))
+            actions = self._sample_actions(gi, num_envs)
+            if hasattr(env, "send") and hasattr(env, "recv"):
+                env.send(actions)
+                self._pending_send.add(int(gi))
+            else:
+                out = env.step(actions)
+                obs = out[0] if isinstance(out, tuple) and len(out) >= 1 else out
+                self._obs_buf[int(gi)] = np.asarray(obs)
+
+    def step_recv(self, game_indices: Iterable[int]) -> None:
+        """Complete stepping for a subset of games started via `step_send`."""
+        for gi in set(int(g) for g in game_indices):
+            if int(gi) not in self._pending_send:
+                continue
+            env = self.envs[gi]
+            out = env.recv()
+            obs = out[0] if isinstance(out, tuple) and len(out) >= 1 else out
+            self._obs_buf[int(gi)] = np.asarray(obs)
+            self._pending_send.discard(int(gi))
 
     def sample(self, env_id: int, n: int) -> np.ndarray:
         """Return `n` stacked observations (uint8) for the given logical env_id."""

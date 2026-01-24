@@ -97,6 +97,76 @@ class ConvStudentEncoder(nn.Module):
         return self.fc(h)
 
 
+class FixedGameTeacher:
+    """A fixed per-game teacher with a fixed gating rule (used to supervise routing).
+
+    For each game g, we create:
+      - gate[g]: [K, d_model] random vectors -> bucket = argmax(x @ gate[g]^T)
+      - A[g]: [K, d_model, d_model] random linear maps applied to x
+
+    This creates a non-trivial "within-game regimes" target so a learned router has
+    something to do beyond simply identifying the game.
+    """
+
+    def __init__(self, n_games: int, k: int, d_model: int, *, seed: int, device: torch.device):
+        self.n_games = int(n_games)
+        self.k = int(k)
+        self.d_model = int(d_model)
+
+        g = torch.Generator(device="cpu")
+        g.manual_seed(int(seed))
+
+        gate = torch.randn(self.n_games, self.k, self.d_model, generator=g, dtype=torch.float32) / (self.d_model**0.5)
+        A = torch.randn(
+            self.n_games,
+            self.k,
+            self.d_model,
+            self.d_model,
+            generator=g,
+            dtype=torch.float32,
+        ) / (self.d_model**0.5)
+
+        self.gate = gate.to(device=device)
+        self.A = A.to(device=device)
+
+    @torch.no_grad()
+    def labels_and_targets(self, x: torch.Tensor, game_ids: torch.Tensor, *, noise_std: float = 0.0):
+        """Return (labels, y) given x=[B,d_model] and game_ids=[B]."""
+        B, d = x.shape
+        labels = torch.empty((B,), device=x.device, dtype=torch.long)
+        y = torch.empty((B, d), device=x.device, dtype=x.dtype)
+
+        for gi in torch.unique(game_ids).tolist():
+            idx = (game_ids == int(gi)).nonzero(as_tuple=False).squeeze(-1)
+            xg = x.index_select(0, idx)
+            gate_g = self.gate[int(gi)]  # [K,d]
+            logits = xg @ gate_g.t()
+            lab = torch.argmax(logits, dim=-1)
+            labels.index_copy_(0, idx, lab)
+
+            A_g = self.A[int(gi)]  # [K,d,d]
+            Ag_lab = A_g.index_select(0, lab)  # [n_i,d,d]
+            yg = torch.einsum("nd,ndm->nm", xg, Ag_lab)
+            y.index_copy_(0, idx, yg)
+
+        if noise_std > 0:
+            y = y + torch.randn_like(y) * float(noise_std)
+        return labels, y
+
+
+class PerGameRouter(nn.Module):
+    """A simple per-game router: one linear head per game, mapping x -> logits over K experts."""
+
+    def __init__(self, n_games: int, d_model: int, k: int):
+        super().__init__()
+        self.n_games = int(n_games)
+        self.k = int(k)
+        self.heads = nn.ModuleList([nn.Linear(int(d_model), int(k)) for _ in range(int(n_games))])
+
+    def forward(self, x: torch.Tensor, game_id: int) -> torch.Tensor:
+        return self.heads[int(game_id)](x)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Out-of-core MoE training prototype on real Atari observations (ALE / Gymnasium).",
@@ -126,6 +196,33 @@ def main() -> None:
     ap.add_argument("--p_stay", type=float, default=0.9)
     ap.add_argument("--envs_per_batch", type=int, default=1)
     ap.add_argument("--sort_by_expert", action="store_true")
+
+    # --- Routing / router learning (semi-fixed routing per game) ---
+    ap.add_argument(
+        "--routing_mode",
+        type=str,
+        default="fixed_env",
+        choices=["fixed_env", "game_router"],
+        help="fixed_env: expert = env_id % n_experts (baseline). "
+        "game_router: fixed expert sets per game + learned selector within that set.",
+    )
+    ap.add_argument("--experts_per_game", type=int, default=8, help="Only used for routing_mode=game_router.")
+    ap.add_argument("--route_sample", action="store_true", help="Sample from router softmax instead of argmax.")
+    ap.add_argument("--route_temperature", type=float, default=1.0, help="Softmax temperature for routing.")
+    ap.add_argument("--router_lr", type=float, default=1e-3)
+    ap.add_argument("--router_wd", type=float, default=0.0)
+    ap.add_argument("--router_loss_weight", type=float, default=0.1, help="Weight on router cross-entropy loss.")
+    ap.add_argument(
+        "--route_miss_penalty",
+        type=float,
+        default=0.0,
+        help="If >0, subtract miss_cost(expert) * route_miss_penalty from router logits.",
+    )
+    ap.add_argument("--miss_cost_gpu", type=float, default=0.0)
+    ap.add_argument("--miss_cost_cpu", type=float, default=0.2)
+    ap.add_argument("--miss_cost_disk", type=float, default=1.0)
+    ap.add_argument("--no_pipeline_env", action="store_true", help="Disable ALE send/recv pipelining (debug).")
+
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log_every", type=int, default=20)
 
@@ -286,7 +383,7 @@ def main() -> None:
     src = AtariBatchSource(games, cfg=atari_cfg, seed=args.seed + 123)
 
     # Determine observation shape so we can set up the featurizers.
-    probe = src.sample(env_id=0, n=1)
+    probe = src.sample_from_buffer(env_id=0, n=1)
     # Expected: (1, stack, H, W) for grayscale.
     if probe.ndim == 4:
         _, c, h, w = probe.shape
@@ -315,12 +412,43 @@ def main() -> None:
         encoder = None
         enc_optim = None
 
-    # Teacher matrices live on CPU by default; optionally moved to GPU for speed.
-    # We keep noise separate so it's applied exactly once.
-    teacher = SyntheticEnvTeacher(args.n_envs, args.d_model, seed=args.seed, noise_std=0.0)
-    teacher_A = teacher.A
-    if device.type == "cuda":
-        teacher_A = teacher_A.to(device=device, dtype=torch.float32)
+
+
+    router: Optional[PerGameRouter] = None
+    router_optim: Optional[torch.optim.Optimizer] = None
+    if args.routing_mode == "game_router":
+        n_games = len(src.envs)
+        k = int(args.experts_per_game)
+        router = PerGameRouter(n_games=n_games, d_model=int(args.d_model), k=k).to(device=device)
+        router_optim = torch.optim.AdamW(
+            router.parameters(), lr=float(args.router_lr), weight_decay=float(args.router_wd)
+        )
+
+    # --- Teacher target ---
+    # fixed_env uses the original per-env random linear map teacher.
+    # game_router uses a per-game mixture teacher (with a fixed gating rule) to supervise routing.
+    teacher_env: Optional[SyntheticEnvTeacher] = None
+    teacher_A: Optional[torch.Tensor] = None
+    teacher_game: Optional[FixedGameTeacher] = None
+
+    if args.routing_mode == "fixed_env":
+        teacher_env = SyntheticEnvTeacher(args.n_envs, args.d_model, seed=args.seed, noise_std=0.0)
+        teacher_A = teacher_env.A
+        if device.type == "cuda":
+            teacher_A = teacher_A.to(device=device, dtype=torch.float32)
+    else:
+        n_games = len(src.envs)
+        k = int(args.experts_per_game)
+        if args.n_experts < n_games * k:
+            raise ValueError(
+                f"routing_mode=game_router requires n_experts >= n_games*experts_per_game "
+                f"({args.n_experts} < {n_games}*{k}={n_games*k}). "
+                f"Either increase --n_experts or reduce --games/--experts_per_game."
+            )
+        teacher_game = FixedGameTeacher(
+            n_games=n_games, k=k, d_model=args.d_model, seed=args.seed + 777, device=device
+        )
+
     if args.sampler == "episode":
         sampler = EnvEpisodeSampler(args.n_envs, episode_len=args.episode_len, seed=args.seed + 1)
     else:
@@ -373,6 +501,18 @@ def main() -> None:
                     encoder.load_state_dict(ckpt["encoder_state"])
                 except Exception:
                     pass
+
+            if router is not None and "router_state" in ckpt and ckpt["router_state"] is not None:
+                try:
+                    router.load_state_dict(ckpt["router_state"])
+                except Exception:
+                    pass
+            if router_optim is not None and "router_optim" in ckpt and ckpt["router_optim"] is not None:
+                try:
+                    router_optim.load_state_dict(ckpt["router_optim"])
+                except Exception:
+                    pass
+
             if enc_optim is not None and "encoder_optim" in ckpt and ckpt["encoder_optim"] is not None:
                 try:
                     enc_optim.load_state_dict(ckpt["encoder_optim"])
@@ -391,13 +531,14 @@ def main() -> None:
         )
         return ids
 
+
     def sample_obs_for_env_ids(env_ids: torch.Tensor) -> torch.Tensor:
         # env_ids is on device; move to CPU for indexing / grouping.
         env_cpu = env_ids.detach().to("cpu")
         obs = None
         for eid in torch.unique(env_cpu).tolist():
             idx = (env_cpu == int(eid)).nonzero(as_tuple=False).squeeze(-1).numpy()
-            chunk = src.sample(int(eid), int(idx.shape[0]))
+            chunk = src.sample_from_buffer(int(eid), int(idx.shape[0]))
             chunk_t = torch.from_numpy(chunk)
             if obs is None:
                 obs = torch.empty((env_cpu.shape[0],) + tuple(chunk_t.shape[1:]), dtype=chunk_t.dtype)
@@ -410,6 +551,24 @@ def main() -> None:
         obs = obs.to(device=device, dtype=torch.float32) / 255.0
         return obs
 
+    def games_for_env_ids(env_ids: torch.Tensor) -> list[int]:
+        env_cpu = env_ids.detach().to("cpu")
+        return sorted({int(src.env_id_to_game_index(int(e))) for e in torch.unique(env_cpu).tolist()})
+
+    def candidate_experts_for_env_ids(env_ids: torch.Tensor) -> list[int]:
+        if args.routing_mode == "fixed_env":
+            return torch.unique(route_fixed_by_env(env_ids, n_experts=args.n_experts)).tolist()
+        # game_router: prefetch the whole expert block for each game in the batch
+        n_games = len(src.envs)
+        k = int(args.experts_per_game)
+        game_ids = torch.unique((env_ids % n_games).long()).tolist()
+        out: list[int] = []
+        for gi in game_ids:
+            base = int(gi) * k
+            out.extend(list(range(base, base + k)))
+        return out
+
+
     # Lookahead buffers for prefetch
     cur_env_ids = make_env_ids()
     cur_expert_ids = route_fixed_by_env(cur_env_ids, n_experts=args.n_experts)
@@ -417,60 +576,149 @@ def main() -> None:
     next_env_ids = make_env_ids()
     next_expert_ids = route_fixed_by_env(next_env_ids, n_experts=args.n_experts)
     if args.prefetch:
-        store.prefetch(torch.unique(next_expert_ids).tolist())
+        store.prefetch(candidate_experts_for_env_ids(next_env_ids))
     if args.prefetch_gpu:
-        store.prefetch_to_gpu(torch.unique(next_expert_ids).tolist(), max_items=args.prefetch_gpu_max)
+        store.prefetch_to_gpu(candidate_experts_for_env_ids(next_env_ids), max_items=args.prefetch_gpu_max)
 
     t0_all = time.perf_counter()
     frames = 0
 
-    for step in iterator:
-        n_unique = int(torch.unique(cur_expert_ids).numel())
-        if n_unique > args.gpu_slots:
-            raise RuntimeError(
-                f"Batch uses {n_unique} unique experts but gpu_slots={args.gpu_slots}. "
-                f"Increase --gpu_slots or reduce --envs_per_batch / batch_size."
-            )
 
-        # Drain any completed prefetch work and ensure current experts are resident.
+    for step in iterator:
+        # Drain any completed prefetch work.
         store.drain_prefetch(max_items=64)
         store.drain_gpu_prefetch(max_items=64)
-        for eid in torch.unique(cur_expert_ids).tolist():
-            store.ensure_on_gpu(int(eid))
 
-        # Launch GPU prefetch for next-step experts into remaining free slots.
+        # Launch GPU prefetch for *next-step candidates* into remaining free slots.
         if args.prefetch_gpu:
-            store.prefetch_to_gpu(torch.unique(next_expert_ids).tolist(), max_items=args.prefetch_gpu_max)
+            store.prefetch_to_gpu(candidate_experts_for_env_ids(next_env_ids), max_items=args.prefetch_gpu_max)
 
-        # --- Collect observations (CPU) ---
+        # --- Collect observations ---
+        games_used = games_for_env_ids(cur_env_ids)
         obs = sample_obs_for_env_ids(cur_env_ids)
         frames += int(obs.shape[0])
 
+        # Kick off environment stepping in the background to overlap with compute.
+        if not args.no_pipeline_env:
+            src.step_send(games_used)
+
         # Teacher features are fixed.
         x_teacher = teacher_feat(obs)
-        # Compute y = A_env x_teacher (same teacher form as SyntheticEnvTeacher, but using observation-derived x).
-        if teacher_A.device == cur_env_ids.device:
-            A_batch = teacher_A.index_select(0, cur_env_ids)
-        else:
-            A_batch = teacher_A.index_select(0, cur_env_ids.to("cpu")).to(device=device, dtype=torch.float32)
-        y_true = torch.einsum("bd,bde->be", x_teacher, A_batch)
-        if args.teacher_noise > 0:
-            y_true = y_true + torch.randn_like(y_true) * float(args.teacher_noise)
 
+        # Compute y_true and (optionally) routing labels.
+        router_labels: Optional[torch.Tensor] = None
+        if args.routing_mode == "fixed_env":
+            assert teacher_A is not None
+            if teacher_A.device == cur_env_ids.device:
+                A_batch = teacher_A.index_select(0, cur_env_ids)
+            else:
+                A_batch = teacher_A.index_select(0, cur_env_ids.to("cpu")).to(device=device, dtype=torch.float32)
+            y_true = torch.einsum("bd,bde->be", x_teacher, A_batch)
+            if args.teacher_noise > 0:
+                y_true = y_true + torch.randn_like(y_true) * float(args.teacher_noise)
+        else:
+            assert teacher_game is not None
+            n_games = len(src.envs)
+            game_ids = (cur_env_ids % n_games).long()
+            router_labels, y_true = teacher_game.labels_and_targets(
+                x_teacher, game_ids, noise_std=float(args.teacher_noise)
+            )
+
+        # Student input to experts/router
         if encoder is None:
             x_in = x_teacher
         else:
             x_in = encoder(obs)
 
+        # --- Routing (choose expert id per token) ---
+        router_loss: Optional[torch.Tensor] = None
+        if args.routing_mode == "fixed_env":
+            cur_expert_ids = route_fixed_by_env(cur_env_ids, n_experts=args.n_experts)
+        else:
+            assert router is not None
+            assert router_optim is not None
+            assert router_labels is not None
+            n_games = len(src.envs)
+            k = int(args.experts_per_game)
+            game_ids = (cur_env_ids % n_games).long()
+
+            expert_ids = torch.empty((x_in.shape[0],), device=device, dtype=torch.long)
+            router_loss_accum = torch.zeros((), device=device, dtype=torch.float32)
+            n_groups = 0
+
+            miss_pen = float(args.route_miss_penalty)
+
+            for gi in torch.unique(game_ids).tolist():
+                idx = (game_ids == int(gi)).nonzero(as_tuple=False).squeeze(-1)
+                xg = x_in.index_select(0, idx)
+
+                logits = router(xg, int(gi))  # [n_i, k]
+
+                # Cache-aware routing bias: subtract miss_cost(expert) * alpha from logits.
+                if miss_pen > 0:
+                    base = int(gi) * k
+                    costs = []
+                    for j in range(k):
+                        eid = base + j
+                        tier = store.residency(eid)
+                        if tier == "gpu":
+                            costs.append(float(args.miss_cost_gpu))
+                        elif tier == "cpu":
+                            costs.append(float(args.miss_cost_cpu))
+                        else:
+                            costs.append(float(args.miss_cost_disk))
+                    cost_t = torch.tensor(costs, device=logits.device, dtype=logits.dtype)
+                    logits = logits - miss_pen * cost_t.view(1, -1)
+
+                temp = float(args.route_temperature)
+                if temp != 1.0:
+                    logits = logits / max(1e-6, temp)
+
+                # Selection (argmax by default; sampling if requested).
+                if args.route_sample:
+                    probs = torch.softmax(logits, dim=-1)
+                    local = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                else:
+                    local = torch.argmax(logits, dim=-1)
+
+                expert_ids.index_copy_(0, idx, local + int(gi) * k)
+
+                # Router supervision: match the teacher's within-game regime label.
+                lab_g = router_labels.index_select(0, idx)
+                router_loss_accum = router_loss_accum + F.cross_entropy(logits.float(), lab_g)
+                n_groups += 1
+
+            router_loss = router_loss_accum / max(1, int(n_groups))
+            cur_expert_ids = expert_ids
+
+        # DType shims
         if device.type == "cuda":
             x_in = x_in.to(dtype=compute_dtype)
             y_true = y_true.to(dtype=compute_dtype)
 
+        # Enforce GPU slot budget and ensure experts are resident on GPU.
+        n_unique = int(torch.unique(cur_expert_ids).numel())
+        if n_unique > args.gpu_slots:
+            raise RuntimeError(
+                f"Batch uses {n_unique} unique experts but gpu_slots={args.gpu_slots}. "
+                f"Increase --gpu_slots or reduce --envs_per_batch / batch_size / experts_per_game."
+            )
+        for eid in torch.unique(cur_expert_ids).tolist():
+            store.ensure_on_gpu(int(eid))
+
+        # Zero grads
         if enc_optim is not None:
             enc_optim.zero_grad(set_to_none=True)
+        if router_optim is not None:
+            router_optim.zero_grad(set_to_none=True)
 
         y_pred = moe_forward_top1(x_in, cur_expert_ids, store, sort_by_expert=args.sort_by_expert)
-        loss = torch.mean((y_pred - y_true) ** 2)
+        mse = torch.mean((y_pred - y_true) ** 2)
+        if router_loss is None:
+            loss = mse
+        else:
+            loss = mse + float(args.router_loss_weight) * router_loss
+
         loss.backward()
 
         # Update experts out-of-core.
@@ -481,6 +729,14 @@ def main() -> None:
         if enc_optim is not None:
             enc_optim.step()
 
+        # Update router in-core (optional).
+        if router_optim is not None:
+            router_optim.step()
+
+        # Complete environment stepping (recv) after compute to overlap with the above.
+        if not args.no_pipeline_env:
+            src.step_recv(games_used)
+
         store.drain_prefetch(max_items=64)
         store.drain_gpu_prefetch(max_items=64)
 
@@ -489,15 +745,19 @@ def main() -> None:
 
         if step % args.log_every == 0 or step == 1:
             loss_val = float(loss.detach().cpu().item())
-            # Show the current game id for intuition.
+            mse_val = float(mse.detach().cpu().item())
+            router_loss_val = float(router_loss.detach().cpu().item()) if router_loss is not None else None
+
             cur_e0 = int(cur_env_ids[0].detach().cpu().item())
             game_idx = src.env_id_to_game_index(cur_e0)
             game_name = src.env_ids[game_idx]
             msg = (
-                f"step={step:5d} loss={loss_val:.6f} unique_experts={n_unique} "
-                f"gpu_cache={len(store.gpu_map)} cpu_cache={len(store.cpu_cache)} "
+                f"step={step:5d} loss={loss_val:.6f} mse={mse_val:.6f} "
+                f"unique_experts={n_unique} gpu_cache={len(store.gpu_map)} cpu_cache={len(store.cpu_cache)} "
                 f"env0={cur_e0} game={game_name}"
             )
+            if router_loss_val is not None:
+                msg += f" router_loss={router_loss_val:.4f}"
             if tqdm is None:
                 print(msg)
             else:
@@ -508,6 +768,8 @@ def main() -> None:
                     {
                         "step": int(step),
                         "loss": float(loss_val),
+                        "mse": float(mse_val),
+                        "router_loss": (float(router_loss_val) if router_loss_val is not None else None),
                         "unique_experts": int(n_unique),
                         "gpu_cache_size": int(len(store.gpu_map)),
                         "cpu_cache_size": int(len(store.cpu_cache)),
@@ -522,7 +784,7 @@ def main() -> None:
         next_env_ids = make_env_ids()
         next_expert_ids = route_fixed_by_env(next_env_ids, n_experts=args.n_experts)
         if args.prefetch:
-            store.prefetch(torch.unique(next_expert_ids).tolist())
+            store.prefetch(candidate_experts_for_env_ids(next_env_ids))
 
         # Periodic checkpoint (flush dirty experts to disk then save a lightweight run checkpoint).
         if run_dir is not None and args.checkpoint_every > 0 and (step % args.checkpoint_every == 0):
@@ -536,6 +798,8 @@ def main() -> None:
                 "sampler_state": sampler.state_dict() if hasattr(sampler, "state_dict") else None,
                 "encoder_state": encoder.state_dict() if encoder is not None else None,
                 "encoder_optim": enc_optim.state_dict() if enc_optim is not None else None,
+                "router_state": router.state_dict() if router is not None else None,
+                "router_optim": router_optim.state_dict() if router_optim is not None else None,
                 "stats": stats.to_dict(),
             }
             atomic_torch_save(run_dir / "checkpoint_last.pt", ckpt)
@@ -564,6 +828,8 @@ def main() -> None:
             "sampler_state": sampler.state_dict() if hasattr(sampler, "state_dict") else None,
             "encoder_state": encoder.state_dict() if encoder is not None else None,
             "encoder_optim": enc_optim.state_dict() if enc_optim is not None else None,
+            "router_state": router.state_dict() if router is not None else None,
+            "router_optim": router_optim.state_dict() if router_optim is not None else None,
             "stats": stats.to_dict(),
         }
         atomic_torch_save(run_dir / "checkpoint_last.pt", ckpt)

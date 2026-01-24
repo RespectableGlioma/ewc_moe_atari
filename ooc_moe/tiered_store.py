@@ -258,6 +258,7 @@ class TieredExpertStore:
             self._io_executor = ThreadPoolExecutor(max_workers=int(io_workers))
 
         # GPU prefetch machinery (HBM prefetch into free slots)
+        self._gpu_prefetch_wanted: set[int] = set()
         self._gpu_prefetch_stream: Optional[torch.cuda.Stream] = None
         self._gpu_prefetch_events: Dict[int, "torch.cuda.Event"] = {}
         if self.device.type == "cuda" and torch.cuda.is_available():
@@ -500,6 +501,25 @@ class TieredExpertStore:
     # GPU residency
     # ----------------------------
 
+
+def residency(self, expert_id: int) -> str:
+    """Return the current tier residency for an expert.
+
+    Returns one of: "gpu", "cpu", "disk", "none".
+    """
+    eid = int(expert_id)
+    if eid in self.gpu_map:
+        return "gpu"
+    if eid in self.cpu_cache:
+        return "cpu"
+    if self.disk is not None and self.disk.exists(eid):
+        return "disk"
+    # If disk exists but file isn't created yet, treat as disk (cold) because
+    # accessing it will require disk init / write before use.
+    if self.disk is not None:
+        return "disk"
+    return "none"
+
     def ensure_on_gpu(self, expert_id: int) -> Tuple[ExpertSlot, int]:
         """Ensure expert is resident in a GPU slot. Returns (slot, slot_idx)."""
         res = self.gpu_map.get(expert_id)
@@ -564,74 +584,91 @@ class TieredExpertStore:
             self.stats.inc("gpu_prefetch_completed", done)
         return done
 
-    def prefetch_to_gpu(self, expert_ids: Iterable[int], *, max_items: int = 0) -> None:
-        """Prefetch experts into free GPU slots.
 
-        This is intentionally conservative:
-          - It never evicts a GPU-resident expert.
-          - It only uses currently free slots.
-          - It only prefetches experts whose CPU state is already available (CPU cache hit or
-            completed disk-prefetch in stash). This avoids blocking the training thread.
+def prefetch_to_gpu(self, expert_ids: Iterable[int], *, max_items: int = 0) -> None:
+    """Prefetch experts into free GPU slots (HBM).
 
-        Use this as a building block; later we can add "evictable prefetch" and true overlap
-        with explicit CUDA event-based scheduling.
-        """
-        if self.device.type != "cuda" or not torch.cuda.is_available():
-            return
-        if self._gpu_prefetch_stream is None:
-            self._gpu_prefetch_stream = torch.cuda.Stream(device=self.device)
+    v6 behavior (more useful in practice than v5):
 
-        # First, incorporate any completed disk->CPU prefetch reads.
-        self.drain_prefetch(max_items=64)
-        self.drain_gpu_prefetch(max_items=64)
+    * You can call this with expert IDs that are currently only on disk.
+      We will (best-effort) schedule disk->CPU prefetch for them and keep them in
+      a "wanted" set, then promote them CPU->GPU once the CPU state becomes ready.
 
-        if not self.free_slots:
-            self.stats.inc("gpu_prefetch_no_free_slot", 1)
-            return
+    * Still conservative:
+        - never evicts GPU-resident experts
+        - only uses currently free slots
 
-        # max_items=0 => fill all free slots
-        budget = len(self.free_slots) if max_items <= 0 else min(len(self.free_slots), int(max_items))
-        if budget <= 0:
-            return
+    This is meant to reduce the "skip_not_ready" pattern you saw in Colab runs
+    (where disk prefetch completes slightly after the GPU-prefetch attempt).
+    """
+    if self.device.type != "cuda" or not torch.cuda.is_available():
+        return
+    if self._gpu_prefetch_stream is None:
+        self._gpu_prefetch_stream = torch.cuda.Stream(device=self.device)
 
-        # Best-effort candidate selection.
-        scheduled = 0
-        for eid in set(int(e) for e in expert_ids):
-            if scheduled >= budget:
-                break
-            if eid in self.gpu_map or eid in self._gpu_prefetch_events:
-                continue
+    wanted_now = set(int(e) for e in expert_ids)
+    wanted_now = {eid for eid in wanted_now if eid not in self.gpu_map and eid not in self._gpu_prefetch_events}
+    if not wanted_now:
+        return
 
-            # Only prefetch if CPU state is already ready (avoid blocking).
-            cpu_entry: Optional[CPUResident] = None
-            if self.cpu_cache.capacity > 0 and eid in self.cpu_cache:
-                cpu_entry = self.cpu_cache.get(eid)
-            elif self.cpu_cache.capacity == 0:
-                st = self._prefetch_stash.pop(eid, None)
-                if st is not None:
-                    cpu_entry = CPUResident(state=st, dirty=False)
+    self._gpu_prefetch_wanted.update(wanted_now)
 
-            if cpu_entry is None:
-                self.stats.inc("gpu_prefetch_skip_not_ready", 1)
-                continue
+    # Ensure disk->CPU prefetch is in flight for any cold experts.
+    self.prefetch(self._gpu_prefetch_wanted)
 
-            # Allocate a free slot and enqueue an H2D copy on the prefetch stream.
-            slot_idx = self.free_slots.pop()
-            slot = self.slots[slot_idx]
+    # Drain completed disk->CPU prefetch and completed GPU-prefetch events.
+    self.drain_prefetch(max_items=64)
+    self.drain_gpu_prefetch(max_items=64)
 
-            with timed(self.stats, "h2d_prefetch"):
-                with torch.cuda.stream(self._gpu_prefetch_stream):
-                    moved = slot.load_from_cpu(cpu_entry.state, non_blocking=True)
-                    evt = torch.cuda.Event()
-                    evt.record(self._gpu_prefetch_stream)
+    if not self.free_slots:
+        self.stats.inc("gpu_prefetch_no_free_slot", 1)
+        return
 
-            # Track bytes and slot residency.
-            self.stats.add_bytes("h2d_bytes", moved)
-            self.stats.inc("h2d_ops", 1)
-            self.stats.inc("gpu_prefetch_scheduled", 1)
-            self._gpu_prefetch_events[eid] = evt
-            self.gpu_map.put(eid, GPUResident(slot_idx=slot_idx))
-            scheduled += 1
+    budget = len(self.free_slots) if max_items <= 0 else min(len(self.free_slots), int(max_items))
+    if budget <= 0:
+        return
+
+    scheduled = 0
+
+    for eid in sorted(list(self._gpu_prefetch_wanted)):
+        if scheduled >= budget:
+            break
+        if eid in self.gpu_map or eid in self._gpu_prefetch_events:
+            self._gpu_prefetch_wanted.discard(eid)
+            continue
+
+        # CPU state must be ready to avoid blocking the training thread.
+        cpu_entry: Optional[CPUResident] = None
+        if self.cpu_cache.capacity > 0 and eid in self.cpu_cache:
+            cpu_entry = self.cpu_cache.get(eid)
+        elif self.cpu_cache.capacity == 0:
+            st = self._prefetch_stash.pop(eid, None)
+            if st is not None:
+                cpu_entry = CPUResident(state=st, dirty=False)
+
+        if cpu_entry is None:
+            # Not ready yet; keep it in the wanted set.
+            self.stats.inc("gpu_prefetch_skip_not_ready", 1)
+            continue
+
+        slot_idx = self.free_slots.pop()
+        slot = self.slots[slot_idx]
+
+        with timed(self.stats, "h2d_prefetch"):
+            with torch.cuda.stream(self._gpu_prefetch_stream):
+                moved = slot.load_from_cpu(cpu_entry.state, non_blocking=True)
+                evt = torch.cuda.Event()
+                evt.record(self._gpu_prefetch_stream)
+
+        self.stats.add_bytes("h2d_bytes", moved)
+        self.stats.inc("h2d_ops", 1)
+        self.stats.inc("gpu_prefetch_scheduled", 1)
+        self._gpu_prefetch_events[eid] = evt
+        self.gpu_map.put(eid, GPUResident(slot_idx=slot_idx))
+        self._gpu_prefetch_wanted.discard(eid)
+        scheduled += 1
+
+    return
 
     # ----------------------------
     # Optimizer update

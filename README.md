@@ -105,9 +105,9 @@ Prefetch:
 - Completed reads are inserted into the CPU LRU by `drain_prefetch()`.
 
 GPU prefetch:
-- `--prefetch_gpu` triggers a 1-step lookahead CPU→GPU prefetch into *currently free* HBM slots using a separate CUDA stream.
+- `--prefetch_gpu` triggers a 1-step lookahead **best-effort** prefetch into *currently free* HBM slots using a separate CUDA stream.
   - It never evicts GPU-resident experts (safe w.r.t. autograd).
-  - It only prefetches experts whose CPU state is already available (CPU-cache hit or completed disk-prefetch staged in a small stash) so it does not block the training thread.
+  - You can request experts that are currently cold on disk; the store will keep them in a "wanted" set and promote them disk→CPU→GPU once ready.
 
 > Note: `--cpu_cache 0` now forces safe write-through to disk during `step_expert()` so training remains correct (but will be much slower than having even a small DRAM cache).
 
@@ -166,6 +166,27 @@ python train_ale.py \
   --writeback_policy evict \
   --sort_by_expert
 ```
+
+
+### Semi-fixed routing per game + learned selector (cache traces)
+
+To move beyond "expert = env_id", `train_ale.py` supports a *semi-fixed* routing mode:
+
+- each game gets a fixed block of experts (`--experts_per_game`, e.g. 8 experts/game)
+- a small *learned router* selects **top‑1** within that block
+- (optional) a cache-aware bias nudges routing toward already-resident experts
+
+Example:
+
+```bash
+python train_ale.py   --routing_mode game_router   --experts_per_game 8   --route_miss_penalty 0.25   --miss_cost_gpu 0.0 --miss_cost_cpu 0.2 --miss_cost_disk 1.0   --n_experts 512 --n_envs 512   --gpu_slots 16 --cpu_cache 64   --disk_root /tmp/ooc_disk --reset_disk   --games Pong,Breakout,SpaceInvaders,Seaquest   --env_backend ale_vec --vec_envs_per_game 8   --batch_size 512 --steps 200   --lr 1e-2 --optim adamw   --prefetch --prefetch_gpu --io_workers 4   --writeback_policy periodic --writeback_every 20   --sort_by_expert
+```
+
+Practical notes:
+- With `routing_mode=game_router`, the number of **unique experts per step** can be up to
+  `experts_per_game` (per game present in the batch). Keep `gpu_slots` ≥ that bound.
+- The router is trained using a fixed per-game "teacher gating" label so you can get realistic
+  cache traces *before* doing full RL-based learned routing.
 
 Pure-Gymnasium wrapper backend (explicit `AtariPreprocessing` + `FrameStackObservation`):
 
