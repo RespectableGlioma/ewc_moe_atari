@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -20,22 +21,33 @@ def timed(stats: "Stats", key: str) -> Iterator[None]:
         yield
     finally:
         dt = time.perf_counter() - t0
-        stats.timers[key] = stats.timers.get(key, 0.0) + dt
+        stats.add_time(key, dt)
 
 @dataclass
 class Stats:
     """
     Lightweight instrumentation container.
+
+    This object may be updated from background I/O threads (prefetch / writeback).
+    We keep internal locking so counters/timers remain consistent.
     """
     timers: Dict[str, float] = field(default_factory=dict)
     counters: Dict[str, int] = field(default_factory=dict)
     bytes_moved: Dict[str, int] = field(default_factory=dict)
 
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
     def inc(self, key: str, n: int = 1) -> None:
-        self.counters[key] = self.counters.get(key, 0) + n
+        with self._lock:
+            self.counters[key] = self.counters.get(key, 0) + n
 
     def add_bytes(self, key: str, nbytes: int) -> None:
-        self.bytes_moved[key] = self.bytes_moved.get(key, 0) + int(nbytes)
+        with self._lock:
+            self.bytes_moved[key] = self.bytes_moved.get(key, 0) + int(nbytes)
+
+    def add_time(self, key: str, seconds: float) -> None:
+        with self._lock:
+            self.timers[key] = self.timers.get(key, 0.0) + float(seconds)
 
     def summary(self) -> str:
         lines = ["== Stats =="]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from pathlib import Path
 
 import torch
@@ -33,6 +34,7 @@ def main():
     ap.add_argument("--gpu_slots", type=int, default=16)
     ap.add_argument("--cpu_cache", type=int, default=64)
     ap.add_argument("--disk_root", type=str, default="", help="If set, use disk as cold store.")
+    ap.add_argument("--reset_disk", action="store_true", help="Delete --disk_root contents before running.")
 
     ap.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--dtype", type=str, default="bf16")
@@ -62,6 +64,8 @@ def main():
     compute_dtype = parse_dtype(args.dtype)
     disk_root = Path(args.disk_root) if args.disk_root else None
     if disk_root is not None:
+        if args.reset_disk and disk_root.exists():
+            shutil.rmtree(disk_root, ignore_errors=True)
         disk_root.mkdir(parents=True, exist_ok=True)
 
     stats = Stats()
@@ -84,7 +88,7 @@ def main():
         activation="gelu",
         disk_root=disk_root,
         pin_cpu=True,
-        with_momentum=False,
+        optim="sgd",
         latency_sim=lat,
         stats=stats,
         seed=args.seed,

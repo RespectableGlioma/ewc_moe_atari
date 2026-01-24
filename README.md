@@ -12,7 +12,7 @@ The goal is to make it easy to test hypotheses like:
 - “What cache sizes do we need to avoid thrashing?”
 - “What is the cost of H2D/D2H and disk I/O under different locality patterns?”
 
-> **Important limitation (v0):**  
+> **Important limitation:**  
 > This prototype assumes the number of **unique experts used in one step** is ≤ `gpu_slots`.  
 > Otherwise you’d need to evict/overwrite weights before backward, which will break autograd.
 
@@ -51,11 +51,11 @@ Look at:
 - `gpu_cache_hit / gpu_cache_miss`
 - `cpu_cache_hit / cpu_cache_miss`
 - `disk_read_ops`, `disk_write_ops`
-- `h2d_load`, `d2h_writeback`, `disk_read`, `disk_write` timers
+- `h2d_load`, `h2d_sync`, `d2h_grads`, `disk_read`, `disk_write` timers
 
 ---
 
-### 2) Run training demo (synthetic teacher)
+### 2) Run training demo (synthetic teacher, out-of-core optimizer state)
 ```bash
 python train.py \
   --n_experts 512 --n_envs 512 \
@@ -64,7 +64,9 @@ python train.py \
   --sampler episode --episode_len 30 \
   --envs_per_batch 1 \
   --batch_size 1024 --steps 200 \
-  --lr 1e-2 \
+  --lr 1e-2 --optim adamw \
+  --prefetch --io_workers 2 \
+  --writeback_policy evict \
   --sort_by_expert
 ```
 
@@ -75,25 +77,40 @@ Notes:
 
 ---
 
-## How the tiered store works (v0 semantics)
+## How the tiered store works (v1 semantics)
 
-- When an expert is loaded into a **GPU slot**, the GPU copy is treated as canonical.
-- After `loss.backward()`, we do **SGD update in-place on the GPU** (`TieredExpertStore.sgd_step_inplace`).
-- When we need a slot for a different expert, we **evict** the LRU resident expert and **write back** its updated weights:
-  - GPU → CPU warm cache (D2H)
-  - and if warm cache evicts, CPU → disk (cold)
+This version is oriented around *real out-of-core training mechanics*:
 
-This approximates: **HBM hot set**, **DRAM warm set**, **disk cold set**.
+- **CPU is canonical** for expert parameters (FP32 master weights) and optimizer state (momentum/Adam).
+- **GPU slots are a cache** used only for forward/backward compute.
+- **Disk/NVMe is the cold backing store** when experts are not present in the warm CPU cache.
+
+One training step (for the active experts) looks like:
+
+1. `ensure_on_gpu(eid)` loads expert weights CPU→GPU (HBM cache).
+2. forward/backward runs on GPU.
+3. `step_expert(eid)`:
+   - copies grads GPU→CPU (`d2h_grads`)
+   - updates CPU master weights + optimizer state (SGD/SGD-momentum/AdamW)
+   - syncs updated weights CPU→GPU (`h2d_sync`) so reusing the cached expert is correct
+4. Dirty CPU experts are persisted according to `--writeback_policy`:
+   - `evict` (default): write back only when the CPU LRU evicts an expert (async)
+   - `periodic`: sync flush dirty experts every N steps
+   - `writethrough`: sync flush every step (slow, but simplest correctness)
+
+Prefetch:
+- `--prefetch` triggers a 1-step lookahead disk→CPU prefetch of the next batch’s expert IDs.
+- Completed reads are inserted into the CPU LRU by `drain_prefetch()`.
 
 ---
 
 ## Next steps (what to build next)
 
 This is the skeleton for the bigger ideas we discussed:
-1. **Prefetch**: predict the next expert set and asynchronously load from disk→CPU→GPU.
-2. **Cache-aware routing**: add a penalty to routing to prefer experts already resident (subject to load balancing).
-3. **Optimizer state**: add momentum/Adam states and decide where they live (HBM vs DRAM vs disk).
-4. **Evict-safe backward**: checkpoint + recompute on backward to allow unique experts per step > `gpu_slots`.
-5. **Real NVMe + AIO/GDS**: replace `torch.save/torch.load` with a tensor I/O backend.
+1. **GPU prefetch**: prefetch into *free* HBM slots for the next microbatch (never evict mid-step).
+2. **Cache-aware routing**: add a routing penalty to prefer experts already resident (with load-balancing).
+3. **Hot/cold optimizer policies**: keep full AdamW for hot experts; cheaper/lazy updates for cold experts.
+4. **Evict-safe backward**: activation checkpoint + recompute to allow unique experts per step > `gpu_slots`.
+5. **Real NVMe I/O**: replace `torch.save/torch.load` with an async tensor I/O backend (AIO/GDS).
 
 If you tell me your target environment (A100/H100? PCIe vs NVLink? local NVMe?), we can evolve the prototype toward something closer to a real training system.

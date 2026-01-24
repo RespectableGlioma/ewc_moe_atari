@@ -1,14 +1,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
 
 
 TensorDict = Dict[str, torch.Tensor]
+
+
+@dataclass
+class ExpertOptState:
+    """Per-expert optimizer state stored on CPU (and optionally persisted to disk)."""
+
+    kind: str  # "sgd", "sgd_momentum", "adamw"
+    step: int = 0
+    tensors: TensorDict = field(default_factory=dict)
 
 
 @dataclass
@@ -20,7 +29,7 @@ class ExpertState:
     opt: optional optimizer state (e.g., momentum buffers) on CPU
     """
     params: TensorDict
-    opt: Optional[TensorDict] = None
+    opt: Optional[ExpertOptState] = None
 
 
 def _activation(x: torch.Tensor, kind: str) -> torch.Tensor:
@@ -62,12 +71,13 @@ def make_expert_state(
         for k in list(params.keys()):
             params[k] = params[k].pin_memory()
 
-    opt: Optional[TensorDict] = None
+    opt: Optional[ExpertOptState] = None
     if with_momentum:
-        opt = {f"m_{k}": torch.zeros_like(v) for k, v in params.items()}
+        tensors = {f"m_{k}": torch.zeros_like(v) for k, v in params.items()}
         if pin_memory and device == "cpu" and torch.cuda.is_available():
-            for k in list(opt.keys()):
-                opt[k] = opt[k].pin_memory()
+            for k in list(tensors.keys()):
+                tensors[k] = tensors[k].pin_memory()
+        opt = ExpertOptState(kind="sgd_momentum", step=0, tensors=tensors)
 
     return ExpertState(params=params, opt=opt)
 
