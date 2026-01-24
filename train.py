@@ -109,6 +109,17 @@ def main() -> None:
     )
     ap.add_argument("--io_workers", type=int, default=2, help="Background disk I/O threads (prefetch + eviction writeback).")
     ap.add_argument("--prefetch", action="store_true", help="Enable 1-step lookahead prefetch (disk->CPU).")
+    ap.add_argument(
+        "--prefetch_gpu",
+        action="store_true",
+        help="Enable 1-step lookahead GPU prefetch into free slots (CPU->GPU on a separate CUDA stream).",
+    )
+    ap.add_argument(
+        "--prefetch_gpu_max",
+        type=int,
+        default=0,
+        help="Max experts to GPU-prefetch per step. 0 => fill all free slots.",
+    )
 
     # Optional latency simulation knobs (useful on fast local SSDs)
     ap.add_argument("--sim_h2d_gbps", type=float, default=0.0)
@@ -202,6 +213,9 @@ def main() -> None:
     next_expert_ids = route_fixed_by_env(next_env_ids, n_experts=args.n_experts)
     if args.prefetch:
         store.prefetch(torch.unique(next_expert_ids).tolist())
+    if args.prefetch_gpu:
+        # Best-effort; will only prefetch if CPU state is already available.
+        store.prefetch_to_gpu(torch.unique(next_expert_ids).tolist(), max_items=args.prefetch_gpu_max)
 
     t0_all = time.perf_counter()
 
@@ -213,6 +227,17 @@ def main() -> None:
                 f"Batch uses {n_unique} unique experts but gpu_slots={args.gpu_slots}. "
                 f"Increase --gpu_slots or reduce --envs_per_batch / batch_size."
             )
+
+        # 0) Drain any completed prefetch work (disk->CPU and CPU->GPU) and
+        #    ensure current experts are resident before we start autograd.
+        store.drain_prefetch(max_items=64)
+        store.drain_gpu_prefetch(max_items=64)
+        for eid in torch.unique(cur_expert_ids).tolist():
+            store.ensure_on_gpu(int(eid))
+
+        # 0.5) Launch GPU prefetch for next-step experts into any remaining free slots.
+        if args.prefetch_gpu:
+            store.prefetch_to_gpu(torch.unique(next_expert_ids).tolist(), max_items=args.prefetch_gpu_max)
 
         x, y_true = teacher.sample_per_token(cur_env_ids, device=device, dtype=torch.float32)
         if device.type == "cuda":
@@ -228,8 +253,9 @@ def main() -> None:
         for eid in torch.unique(cur_expert_ids).tolist():
             store.step_expert(int(eid), lr=args.lr, weight_decay=args.weight_decay)
 
-        # Drain any completed prefetch reads into CPU warm cache.
+        # Drain any completed prefetch work.
         store.drain_prefetch(max_items=64)
+        store.drain_gpu_prefetch(max_items=64)
 
         if device.type == "cuda" and (step % args.log_every == 0 or step == 1):
             torch.cuda.synchronize()

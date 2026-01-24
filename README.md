@@ -102,6 +102,13 @@ Prefetch:
 - `--prefetch` triggers a 1-step lookahead disk→CPU prefetch of the next batch’s expert IDs.
 - Completed reads are inserted into the CPU LRU by `drain_prefetch()`.
 
+GPU prefetch:
+- `--prefetch_gpu` triggers a 1-step lookahead CPU→GPU prefetch into *currently free* HBM slots using a separate CUDA stream.
+  - It never evicts GPU-resident experts (safe w.r.t. autograd).
+  - It only prefetches experts whose CPU state is already available (CPU-cache hit or completed disk-prefetch staged in a small stash) so it does not block the training thread.
+
+> Note: `--cpu_cache 0` now forces safe write-through to disk during `step_expert()` so training remains correct (but will be much slower than having even a small DRAM cache).
+
 ---
 
 ## Next steps (what to build next)

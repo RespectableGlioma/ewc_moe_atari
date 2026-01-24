@@ -127,17 +127,21 @@ class ExpertSlot:
         }
 
     def load_from_cpu(self, cpu_state: ExpertState, non_blocking: bool = True) -> int:
-        """
-        Copy CPU master weights into this slot. Returns bytes moved host->device.
+        """Copy CPU master weights into this slot.
+
+        Returns bytes moved host->device.
+
+        Note: We intentionally use Tensor.copy_ directly to avoid allocating a temporary
+        GPU tensor via src.to(device=...). PyTorch will handle dtype conversion during
+        the copy.
         """
         nbytes = 0
         with torch.no_grad():
             for k, t in self.params.items():
                 src = cpu_state.params[k]
-                # Cast to compute dtype on transfer.
-                t.copy_(src.to(device=self.device, dtype=self.compute_dtype, non_blocking=non_blocking))
+                # copy_ supports cross-device + dtype conversion.
+                t.copy_(src, non_blocking=non_blocking)
                 nbytes += src.numel() * src.element_size()
-        # Clear any stale grads
         self.zero_grad()
         return nbytes
 
