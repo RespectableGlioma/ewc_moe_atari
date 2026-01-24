@@ -21,11 +21,13 @@ The goal is to make it easy to test hypotheses like:
 ## Files
 
 - `train.py` — simple synthetic training loop (MSE regression teacher per environment)
+- `train_ale.py` — training loop on real Atari observations (ALE / Gymnasium)
 - `bench_cache.py` — stress-test the cache without training compute
 - `ooc_moe/tiered_store.py` — the tiered cache + disk store + writeback
 - `ooc_moe/moe.py` — top‑1 MoE forward + fixed router
 - `ooc_moe/synthetic.py` — environment-correlated stream + synthetic teacher
 - `ooc_moe/expert.py` — functional FFN expert + GPU slot tensors
+- `ooc_moe/atari.py` — Atari (ALE) vector env batching helper
 
 ---
 
@@ -119,5 +121,70 @@ This is the skeleton for the bigger ideas we discussed:
 3. **Hot/cold optimizer policies**: keep full AdamW for hot experts; cheaper/lazy updates for cold experts.
 4. **Evict-safe backward**: activation checkpoint + recompute to allow unique experts per step > `gpu_slots`.
 5. **Real NVMe I/O**: replace `torch.save/torch.load` with an async tensor I/O backend (AIO/GDS).
+
+---
+
+## Atari/ALE integration (real observations)
+
+This repo now includes a **real-observation** training script, `train_ale.py`, that
+keeps the same out-of-core expert/optimizer machinery but replaces the synthetic
+`x ~ N(0,I)` stream with **Atari frames**.
+
+### Install Atari deps
+
+Gymnasium v1.0 removed the hidden “plugin import” behavior that used to let you
+create Atari envs without importing `ale_py` first. Now, you either:
+
+- import `ale_py` and call `gym.register_envs(ale_py)` before `gym.make(...)`, or
+- use the `module:env_id` form like `ale_py:ALE/Pong-v5`.
+
+This codebase handles that internally, but you still need the packages.
+
+Recommended:
+
+```bash
+pip install "gymnasium[atari]"
+```
+
+Or, using the provided file:
+
+```bash
+pip install -r requirements_atari.txt
+```
+
+### Run the Atari demo
+
+Fastest backend (ALE's native C++ vector env via `gym.make_vec`, which the ALE docs describe as
+equivalent to `AtariPreprocessing` + `FrameStackObservation`):
+
+```bash
+python train_ale.py \
+  --n_experts 512 --n_envs 512 \
+  --gpu_slots 16 --cpu_cache 64 \
+  --disk_root /tmp/ooc_disk --reset_disk \
+  --games Pong,Breakout,SpaceInvaders,Seaquest \
+  --env_backend ale_vec --vec_envs_per_game 8 \
+  --batch_size 512 --steps 200 \
+  --lr 1e-2 --optim adamw \
+  --prefetch --prefetch_gpu --io_workers 4 \
+  --writeback_policy evict \
+  --sort_by_expert
+```
+
+Pure-Gymnasium wrapper backend (explicit `AtariPreprocessing` + `FrameStackObservation`):
+
+```bash
+python train_ale.py \
+  --env_backend wrappers \
+  --games Pong,Breakout \
+  --batch_size 256 --steps 100
+```
+
+Notes:
+
+- By default, the “teacher” target is computed from a **fixed (non-trainable) featurizer** of the
+  Atari frames. This prevents a trivial collapse where a learnable encoder outputs zeros and makes
+  the objective vanish.
+- If you want a learnable in-core encoder anyway, add `--encoder conv`.
 
 If you tell me your target environment (A100/H100? PCIe vs NVLink? local NVMe?), we can evolve the prototype toward something closer to a real training system.
