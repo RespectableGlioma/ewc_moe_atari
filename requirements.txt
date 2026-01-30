@@ -1,2 +1,12 @@
-torch
-tqdm
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+
+# For Atari environments (optional)
+gymnasium[atari]>=0.29.0
+ale-py>=0.8.0
+opencv-python>=4.8.0
+
+# For visualization and logging (optional)
+tensorboard>=2.14.0
+matplotlib>=3.7.0
