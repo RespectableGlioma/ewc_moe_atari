@@ -469,7 +469,7 @@ class MoERLAgentConfig:
     
     def create_agent(self, device: str = "cuda") -> MoERLAgent:
         """Create agent from config."""
-        return MoERLAgent(
+        agent = MoERLAgent(
             obs_shape=self.obs_shape,
             num_actions=self.num_actions,
             num_experts=self.num_experts,
@@ -486,6 +486,7 @@ class MoERLAgentConfig:
             dropout=self.dropout,
             device=device,
         )
+        return agent.to(device)
     
     def estimate_parameter_count(self) -> Dict[str, int]:
         """Estimate parameter counts for different components."""
