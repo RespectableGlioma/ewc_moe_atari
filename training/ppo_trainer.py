@@ -105,12 +105,15 @@ class PPOTrainer:
         current_reward = 0
         current_length = 0
 
+        # Get valid action count for this environment
+        n_actions = env.action_space.n
+
         for _ in range(self.n_steps):
             with torch.no_grad():
                 action, log_prob, value = self.expert.get_action(obs)
 
-            # Step environment
-            action_np = action.cpu().numpy()[0]
+            # Step environment - clip action to valid range for this game
+            action_np = action.cpu().numpy()[0] % n_actions
             next_obs_np, reward, terminated, truncated, info = env.step(action_np)
             done = terminated or truncated
 
