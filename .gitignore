@@ -215,3 +215,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific: Training outputs
+checkpoints/
+logs/
+expert_library/
+*.pt
+*.pth
+final_checkpoint.pt
+
+# Tensorboard
+runs/
+events.out.*
