@@ -185,9 +185,11 @@ class AtariWrapper(gym.Wrapper):
         frame_stack: int = 4,
         clip_reward: bool = True,
         terminal_on_life_loss: bool = True,
+        apply_frame_skip: bool = True,
     ):
         env = NoopResetEnv(env, noop_max=noop_max)
-        env = MaxAndSkipEnv(env, skip=frame_skip)
+        if apply_frame_skip:
+            env = MaxAndSkipEnv(env, skip=frame_skip)
         if terminal_on_life_loss:
             env = EpisodicLifeEnv(env)
         if 'FIRE' in env.unwrapped.get_action_meanings():
@@ -217,17 +219,48 @@ def make_atari_env(
     Returns:
         Wrapped Atari environment
     """
-    # Ensure proper game ID format
-    if not game_name.endswith("NoFrameskip-v4"):
-        game_id = f"{game_name}NoFrameskip-v4"
-    else:
-        game_id = game_name
+    # Try different environment ID formats for compatibility
+    # Old format with NoFrameskip: BreakoutNoFrameskip-v4 (we apply our own frameskip)
+    # New ALE format: ALE/Breakout-v5 (frameskip=1 to disable built-in)
 
-    env = gym.make(game_id, render_mode=render_mode)
+    env = None
+    used_v5 = False
+    last_error = None
+
+    if "/" in game_name or game_name.endswith("-v4") or game_name.endswith("-v5"):
+        # Already a full ID
+        try:
+            if "-v5" in game_name:
+                env = gym.make(game_name, render_mode=render_mode, frameskip=1)
+                used_v5 = True
+            else:
+                env = gym.make(game_name, render_mode=render_mode)
+        except Exception as e:
+            last_error = e
+    else:
+        # Try old NoFrameskip format first (more compatible with wrappers)
+        try:
+            env = gym.make(f"{game_name}NoFrameskip-v4", render_mode=render_mode)
+        except Exception as e:
+            last_error = e
+            # Try new ALE format with frameskip=1
+            try:
+                env = gym.make(f"ALE/{game_name}-v5", render_mode=render_mode, frameskip=1)
+                used_v5 = True
+                last_error = None
+            except Exception as e2:
+                last_error = e2
+
+    if env is None:
+        raise RuntimeError(
+            f"Could not create environment for '{game_name}'. "
+            f"Last error: {last_error}"
+        )
 
     if seed is not None:
         env.reset(seed=seed)
 
+    # For v5 envs with frameskip=1, we still apply our own frame skip wrapper
     env = AtariWrapper(env, **kwargs)
     return env
 
@@ -254,7 +287,13 @@ ATARI_GAMES = [
 
 def get_num_actions(game_name: str) -> int:
     """Get number of actions for a specific game."""
-    env = gym.make(f"{game_name}NoFrameskip-v4")
-    num_actions = env.action_space.n
-    env.close()
-    return num_actions
+    # Try different formats
+    for game_id in [f"ALE/{game_name}-v5", f"{game_name}NoFrameskip-v4"]:
+        try:
+            env = gym.make(game_id)
+            num_actions = env.action_space.n
+            env.close()
+            return num_actions
+        except Exception:
+            continue
+    raise RuntimeError(f"Could not find environment for {game_name}")
