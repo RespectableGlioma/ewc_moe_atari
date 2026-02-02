@@ -10,6 +10,13 @@ from gymnasium import spaces
 from typing import Optional, Tuple, List
 from collections import deque
 
+# Register ALE environments - must be imported before creating Atari envs
+try:
+    import ale_py
+    gym.register_envs(ale_py)
+except ImportError:
+    pass  # ale_py not installed, will try legacy format
+
 
 class NoopResetEnv(gym.Wrapper):
     """
