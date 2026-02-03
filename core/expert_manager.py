@@ -36,6 +36,7 @@ class ExpertManager:
         num_actions: int = 18,
         obs_shape: Tuple[int, ...] = (4, 84, 84),
         max_experts_in_memory: int = 2,  # Active + prefetched
+        unified_action_space=None,
     ):
         self.device = device
         self.epsilon = epsilon
@@ -44,6 +45,7 @@ class ExpertManager:
         self.num_actions = num_actions
         self.obs_shape = obs_shape
         self.max_experts_in_memory = max_experts_in_memory
+        self.unified_action_space = unified_action_space
 
         # Tiered storage for experts
         self.storage = TieredStore(storage_path)

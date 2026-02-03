@@ -142,6 +142,7 @@ class Expert(nn.Module):
         self,
         obs: torch.Tensor,
         deterministic: bool = False,
+        action_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample action from policy.
@@ -149,6 +150,8 @@ class Expert(nn.Module):
         Args:
             obs: (batch, C, H, W) observations
             deterministic: if True, take argmax instead of sampling
+            action_mask: optional (num_actions,) or (batch, num_actions) bool mask.
+                         True = valid action. Invalid logits set to -inf.
 
         Returns:
             action: (batch,) sampled actions
@@ -156,6 +159,12 @@ class Expert(nn.Module):
             value: (batch,) value estimates
         """
         policy_logits, value = self.forward(obs)
+
+        if action_mask is not None:
+            if action_mask.dim() == 1:
+                action_mask = action_mask.unsqueeze(0).expand_as(policy_logits)
+            policy_logits = policy_logits.masked_fill(~action_mask, float('-inf'))
+
         dist = Categorical(logits=policy_logits)
 
         if deterministic:
@@ -170,13 +179,15 @@ class Expert(nn.Module):
         self,
         obs: torch.Tensor,
         actions: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Evaluate actions for PPO update.
 
         Args:
             obs: (batch, C, H, W) observations
-            actions: (batch,) actions taken
+            actions: (batch,) actions taken (in unified action space)
+            action_mask: optional (num_actions,) or (batch, num_actions) bool mask.
 
         Returns:
             log_prob: (batch,) log probabilities of actions
@@ -184,6 +195,12 @@ class Expert(nn.Module):
             entropy: (batch,) policy entropy
         """
         policy_logits, value = self.forward(obs)
+
+        if action_mask is not None:
+            if action_mask.dim() == 1:
+                action_mask = action_mask.unsqueeze(0).expand_as(policy_logits)
+            policy_logits = policy_logits.masked_fill(~action_mask, float('-inf'))
+
         dist = Categorical(logits=policy_logits)
 
         log_prob = dist.log_prob(actions)

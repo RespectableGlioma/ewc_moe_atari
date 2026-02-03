@@ -41,9 +41,11 @@ class PPOTrainer:
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         target_kl: Optional[float] = 0.01,
+        unified_action_space=None,
     ):
         self.expert = expert
         self.device = device
+        self.unified_action_space = unified_action_space
 
         # PPO hyperparameters
         self.learning_rate = learning_rate
@@ -85,6 +87,7 @@ class PPOTrainer:
         self,
         env,
         obs: torch.Tensor,
+        game_name: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Dict]:
         """
         Collect rollout data from environment.
@@ -92,6 +95,7 @@ class PPOTrainer:
         Args:
             env: Gymnasium environment
             obs: (1, C, H, W) initial observation
+            game_name: current game name for action masking
 
         Returns:
             last_obs: final observation
@@ -105,16 +109,27 @@ class PPOTrainer:
         current_reward = 0
         current_length = 0
 
-        # Get valid action count for this environment
-        n_actions = env.action_space.n
+        # Get action mask for this game
+        action_mask = None
+        if self.unified_action_space is not None and game_name is not None:
+            action_mask = self.unified_action_space.get_mask(game_name, self.device)
 
         for _ in range(self.n_steps):
             with torch.no_grad():
-                action, log_prob, value = self.expert.get_action(obs)
+                action, log_prob, value = self.expert.get_action(
+                    obs, action_mask=action_mask
+                )
 
-            # Step environment - clip action to valid range for this game
-            action_np = action.cpu().numpy()[0] % n_actions
-            next_obs_np, reward, terminated, truncated, info = env.step(action_np)
+            # Map unified action to local game action for env.step()
+            unified_action = action.cpu().item()
+            if self.unified_action_space is not None and game_name is not None:
+                local_action = self.unified_action_space.unified_to_local_action(
+                    unified_action, game_name
+                )
+            else:
+                local_action = unified_action
+
+            next_obs_np, reward, terminated, truncated, info = env.step(local_action)
             done = terminated or truncated
 
             current_reward += reward
@@ -124,7 +139,7 @@ class PPOTrainer:
             reward_t = torch.tensor([reward], dtype=torch.float32, device=self.device)
             done_t = torch.tensor([float(done)], dtype=torch.float32, device=self.device)
 
-            # Store in buffer
+            # Store unified action in buffer
             self.buffer.add(
                 obs=obs.squeeze(0),
                 action=action,
@@ -169,14 +184,22 @@ class PPOTrainer:
 
         return obs, info
 
-    def train(self) -> Dict[str, float]:
+    def train(self, game_name: Optional[str] = None) -> Dict[str, float]:
         """
         Perform PPO update on collected rollout.
+
+        Args:
+            game_name: current game name for action masking
 
         Returns:
             Dictionary of training metrics
         """
         self.expert.train()
+
+        # Get action mask for this game
+        action_mask = None
+        if self.unified_action_space is not None and game_name is not None:
+            action_mask = self.unified_action_space.get_mask(game_name, self.device)
 
         clip_fractions = []
         value_losses = []
@@ -195,8 +218,10 @@ class PPOTrainer:
                     returns,
                 ) = batch
 
-                # Evaluate current policy
-                log_probs, values, entropy = self.expert.evaluate_actions(obs, actions)
+                # Evaluate current policy with mask
+                log_probs, values, entropy = self.expert.evaluate_actions(
+                    obs, actions, action_mask=action_mask
+                )
 
                 # Ratio for PPO clipping
                 ratio = torch.exp(log_probs - old_log_probs)
@@ -270,6 +295,7 @@ class PPOTrainer:
         self,
         env,
         obs: torch.Tensor,
+        game_name: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Dict]:
         """
         Perform one rollout + training step.
@@ -277,16 +303,17 @@ class PPOTrainer:
         Args:
             env: Gymnasium environment
             obs: Initial observation
+            game_name: current game name for action masking
 
         Returns:
             last_obs: Final observation
             metrics: Combined rollout and training metrics
         """
         # Collect rollout
-        last_obs, rollout_info = self.collect_rollout(env, obs)
+        last_obs, rollout_info = self.collect_rollout(env, obs, game_name=game_name)
 
         # Train on rollout
-        train_metrics = self.train()
+        train_metrics = self.train(game_name=game_name)
 
         metrics = {
             **rollout_info,
@@ -299,9 +326,15 @@ class PPOTrainer:
         self,
         obs: torch.Tensor,
         deterministic: bool = False,
+        game_name: Optional[str] = None,
     ) -> torch.Tensor:
         """Get action from current expert."""
         self.expert.eval()
+        action_mask = None
+        if self.unified_action_space is not None and game_name is not None:
+            action_mask = self.unified_action_space.get_mask(game_name, self.device)
         with torch.no_grad():
-            action, _, _ = self.expert.get_action(obs, deterministic)
+            action, _, _ = self.expert.get_action(
+                obs, deterministic, action_mask=action_mask
+            )
         return action

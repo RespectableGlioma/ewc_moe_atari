@@ -23,6 +23,7 @@ from tqdm import tqdm
 from core import MetaRSSM, Expert, ExpertManager
 from training import PPOTrainer
 from envs import make_atari_env, GameCurriculum, CurriculumType, ATARI_GAMES
+from envs.action_space import UnifiedActionSpace
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -88,6 +89,10 @@ class DayNightTrainer:
 
         self.meta_optimizer = Adam(self.meta_agent.parameters(), lr=meta_lr)
 
+        # Unified action space across all training games
+        self.unified_action_space = UnifiedActionSpace(games)
+        self.unified_action_space.to_device(device)
+
         # Expert manager
         self.expert_manager = ExpertManager(
             storage_path=str(self.save_dir / "experts"),
@@ -95,7 +100,8 @@ class DayNightTrainer:
             epsilon=0.5,
             code_dim=32,
             codebook_size=64,
-            num_actions=18,  # Max Atari actions
+            num_actions=self.unified_action_space.num_actions,
+            unified_action_space=self.unified_action_space,
         )
 
         # PPO trainer (will be set per expert)
@@ -164,6 +170,7 @@ class DayNightTrainer:
                     device=self.device,
                     learning_rate=self.expert_lr,
                     n_steps=self.n_steps_per_update,
+                    unified_action_space=self.unified_action_space,
                 )
             else:
                 self.ppo_trainer.set_expert(expert)
@@ -184,7 +191,7 @@ class DayNightTrainer:
                     kl = meta_outputs['kl'].item()
 
                     # Collect rollout and train
-                    obs, metrics = self.ppo_trainer.step(env, obs)
+                    obs, metrics = self.ppo_trainer.step(env, obs, game_name=game_name)
 
                     # Accumulate rewards from rollout info
                     episode_rewards = metrics.get('episode_rewards', [])
