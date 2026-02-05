@@ -346,19 +346,22 @@ class MetaRSSM(nn.Module):
     def night_update(
         self,
         cumulative_reward: float,
-    ) -> dict:
+        selection_log_probs: Optional[list] = None,
+    ) -> Tuple[Optional[torch.Tensor], dict]:
         """
-        Night update: adjust baseline for REINFORCE.
+        Night update: compute REINFORCE loss for expert selection.
 
-        The meta-agent's "actions" (switch timing, expert selection) are
-        implicitly learned through the embedding space. Good expert retrieval
-        leads to high cumulative reward.
+        The prior network p(code | h) serves as the policy. We reinforce
+        code selections that led to high cumulative rewards.
 
         Args:
             cumulative_reward: total reward from K games
+            selection_log_probs: list of log_prob tensors from day phase
+                                 (one per expert selection decision)
 
         Returns:
-            metrics dict
+            loss: REINFORCE loss tensor (or None if no log_probs provided)
+            metrics: dict with advantage, baseline, loss value
         """
         reward_tensor = torch.tensor(cumulative_reward, device=self.baseline.device)
 
@@ -369,10 +372,27 @@ class MetaRSSM(nn.Module):
         self.baseline = (1 - alpha) * self.baseline + alpha * reward_tensor
         self.baseline_count += 1
 
-        return {
+        metrics = {
             'advantage': advantage.item(),
             'baseline': self.baseline.item(),
         }
+
+        # Compute REINFORCE loss if log_probs provided
+        if selection_log_probs is not None and len(selection_log_probs) > 0:
+            # Stack log probs: each is (batch,) or scalar
+            # Sum over all selections in the day
+            total_log_prob = torch.stack(selection_log_probs).sum()
+
+            # REINFORCE: maximize expected reward = minimize -advantage * log_prob
+            # Detach advantage (it's the reward signal, not part of the graph)
+            reinforce_loss = -advantage.detach() * total_log_prob
+
+            metrics['reinforce_loss'] = reinforce_loss.item()
+            metrics['mean_log_prob'] = (total_log_prob / len(selection_log_probs)).item()
+
+            return reinforce_loss, metrics
+
+        return None, metrics
 
     def get_game_embedding(self, state: MetaRSSMState) -> torch.Tensor:
         """Get current game embedding for expert retrieval."""
@@ -381,3 +401,27 @@ class MetaRSSM(nn.Module):
     def get_game_code(self, state: MetaRSSMState) -> torch.Tensor:
         """Get current game code index."""
         return state.code_idx
+
+    def get_selection_log_prob(
+        self,
+        state: MetaRSSMState,
+        code_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Get log probability of selected code under the prior policy.
+
+        This is used for REINFORCE: the prior p(code | h) serves as
+        the policy for expert selection.
+
+        Args:
+            state: current MetaRSSMState (need h for prior)
+            code_idx: (batch,) selected code indices
+
+        Returns:
+            (batch,) log probabilities
+        """
+        prior_logits = self.prior_net(state.h)
+        log_probs = F.log_softmax(prior_logits, dim=-1)
+        # Gather log prob for selected codes
+        selected_log_probs = log_probs.gather(1, code_idx.unsqueeze(-1)).squeeze(-1)
+        return selected_log_probs

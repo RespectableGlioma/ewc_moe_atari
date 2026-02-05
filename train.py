@@ -128,11 +128,12 @@ class DayNightTrainer:
         Run one day of training: K games with expert training.
 
         Returns:
-            Day statistics
+            Day statistics including selection_log_probs for REINFORCE
         """
         day_rewards = []
         day_frames = 0
         meta_losses = []
+        selection_log_probs = []  # Track log probs for REINFORCE
 
         # Meta-agent state
         meta_state = self.meta_agent.init_state(1, self.device)
@@ -148,7 +149,15 @@ class DayNightTrainer:
             # Get game embedding from meta-agent
             meta_state, meta_outputs = self.meta_agent(obs, meta_state)
             game_embedding = self.meta_agent.get_game_embedding(meta_state)
-            game_code = self.meta_agent.get_game_code(meta_state).item()
+            game_code = self.meta_agent.get_game_code(meta_state)  # Keep as tensor
+
+            # Store log probability of this code selection for REINFORCE
+            selection_log_prob = self.meta_agent.get_selection_log_prob(
+                meta_state, game_code
+            )
+            selection_log_probs.append(selection_log_prob)
+
+            game_code_int = game_code.item()  # Convert to int for expert manager
 
             # Detect switch and get appropriate expert
             kl = meta_outputs['kl'].item()
@@ -158,7 +167,7 @@ class DayNightTrainer:
                 logger.info(f"Switch detected (KL={kl:.2f}), retrieving expert")
                 expert = self.expert_manager.retrieve_or_create(
                     embedding=game_embedding.squeeze(0),
-                    code_idx=game_code,
+                    code_idx=game_code_int,
                 )
             else:
                 expert = self.expert_manager.get_active_expert()
@@ -246,6 +255,7 @@ class DayNightTrainer:
             'num_episodes': len(day_rewards),
             'day_frames': day_frames,
             'mean_meta_loss': np.mean(meta_losses),
+            'selection_log_probs': selection_log_probs,  # For REINFORCE
         }
 
     def _train_meta_step(self, obs: torch.Tensor) -> tuple:
@@ -270,20 +280,38 @@ class DayNightTrainer:
 
     def run_night(self, day_stats: Dict) -> Dict:
         """
-        Run night phase: meta-agent update based on day performance.
+        Run night phase: meta-agent REINFORCE update based on day performance.
 
         Args:
-            day_stats: Statistics from the day phase
+            day_stats: Statistics from the day phase (includes selection_log_probs)
 
         Returns:
             Night update metrics
         """
         cumulative_reward = day_stats['day_reward']
-        metrics = self.meta_agent.night_update(cumulative_reward)
+        selection_log_probs = day_stats.get('selection_log_probs', [])
 
+        # Compute REINFORCE loss and get metrics
+        self.meta_optimizer.zero_grad()
+        reinforce_loss, metrics = self.meta_agent.night_update(
+            cumulative_reward,
+            selection_log_probs=selection_log_probs,
+        )
+
+        # Apply REINFORCE gradient if loss was computed
+        if reinforce_loss is not None:
+            reinforce_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.meta_agent.parameters(), 1.0)
+            self.meta_optimizer.step()
+
+        # Logging
         self.writer.add_scalar('night/cumulative_reward', cumulative_reward, self.day_count)
         self.writer.add_scalar('night/baseline', metrics['baseline'], self.day_count)
         self.writer.add_scalar('night/advantage', metrics['advantage'], self.day_count)
+        if 'reinforce_loss' in metrics:
+            self.writer.add_scalar('night/reinforce_loss', metrics['reinforce_loss'], self.day_count)
+        if 'mean_log_prob' in metrics:
+            self.writer.add_scalar('night/mean_log_prob', metrics['mean_log_prob'], self.day_count)
 
         return metrics
 
