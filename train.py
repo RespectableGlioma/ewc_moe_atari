@@ -133,7 +133,7 @@ class DayNightTrainer:
         day_rewards = []
         day_frames = 0
         meta_losses = []
-        selection_log_probs = []  # Track log probs for REINFORCE
+        selection_data = []  # Track (h_state, code_idx) for REINFORCE
 
         # Meta-agent state
         meta_state = self.meta_agent.init_state(1, self.device)
@@ -151,11 +151,9 @@ class DayNightTrainer:
             game_embedding = self.meta_agent.get_game_embedding(meta_state)
             game_code = self.meta_agent.get_game_code(meta_state)  # Keep as tensor
 
-            # Store log probability of this code selection for REINFORCE
-            selection_log_prob = self.meta_agent.get_selection_log_prob(
-                meta_state, game_code
-            )
-            selection_log_probs.append(selection_log_prob)
+            # Store (h_state, code_idx) for REINFORCE - detach h to avoid graph issues
+            # We'll recompute log_probs at night with current parameters
+            selection_data.append((meta_state.h.detach().clone(), game_code.detach().clone()))
 
             game_code_int = game_code.item()  # Convert to int for expert manager
 
@@ -255,7 +253,7 @@ class DayNightTrainer:
             'num_episodes': len(day_rewards),
             'day_frames': day_frames,
             'mean_meta_loss': np.mean(meta_losses),
-            'selection_log_probs': selection_log_probs,  # For REINFORCE
+            'selection_data': selection_data,  # For REINFORCE
         }
 
     def _train_meta_step(self, obs: torch.Tensor) -> tuple:
@@ -289,13 +287,13 @@ class DayNightTrainer:
             Night update metrics
         """
         cumulative_reward = day_stats['day_reward']
-        selection_log_probs = day_stats.get('selection_log_probs', [])
+        selection_data = day_stats.get('selection_data', [])
 
         # Compute REINFORCE loss and get metrics
         self.meta_optimizer.zero_grad()
         reinforce_loss, metrics = self.meta_agent.night_update(
             cumulative_reward,
-            selection_log_probs=selection_log_probs,
+            selection_data=selection_data,
         )
 
         # Apply REINFORCE gradient if loss was computed

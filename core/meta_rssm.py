@@ -346,7 +346,7 @@ class MetaRSSM(nn.Module):
     def night_update(
         self,
         cumulative_reward: float,
-        selection_log_probs: Optional[list] = None,
+        selection_data: Optional[list] = None,
     ) -> Tuple[Optional[torch.Tensor], dict]:
         """
         Night update: compute REINFORCE loss for expert selection.
@@ -356,11 +356,11 @@ class MetaRSSM(nn.Module):
 
         Args:
             cumulative_reward: total reward from K games
-            selection_log_probs: list of log_prob tensors from day phase
-                                 (one per expert selection decision)
+            selection_data: list of (h_state, code_idx) tuples from day phase
+                           We recompute log_probs here to avoid stale gradients
 
         Returns:
-            loss: REINFORCE loss tensor (or None if no log_probs provided)
+            loss: REINFORCE loss tensor (or None if no selection_data provided)
             metrics: dict with advantage, baseline, loss value
         """
         reward_tensor = torch.tensor(cumulative_reward, device=self.baseline.device)
@@ -377,18 +377,27 @@ class MetaRSSM(nn.Module):
             'baseline': self.baseline.item(),
         }
 
-        # Compute REINFORCE loss if log_probs provided
-        if selection_log_probs is not None and len(selection_log_probs) > 0:
-            # Stack log probs: each is (batch,) or scalar
+        # Compute REINFORCE loss if selection_data provided
+        if selection_data is not None and len(selection_data) > 0:
+            # Recompute log_probs with current parameters
+            log_probs = []
+            for h_state, code_idx in selection_data:
+                # h_state is detached, code_idx is the selection made
+                # Compute log prob under current prior
+                prior_logits = self.prior_net(h_state)
+                log_prob = F.log_softmax(prior_logits, dim=-1)
+                selected_log_prob = log_prob.gather(1, code_idx.unsqueeze(-1)).squeeze(-1)
+                log_probs.append(selected_log_prob)
+
             # Sum over all selections in the day
-            total_log_prob = torch.stack(selection_log_probs).sum()
+            total_log_prob = torch.stack(log_probs).sum()
 
             # REINFORCE: maximize expected reward = minimize -advantage * log_prob
             # Detach advantage (it's the reward signal, not part of the graph)
             reinforce_loss = -advantage.detach() * total_log_prob
 
             metrics['reinforce_loss'] = reinforce_loss.item()
-            metrics['mean_log_prob'] = (total_log_prob / len(selection_log_probs)).item()
+            metrics['mean_log_prob'] = (total_log_prob / len(log_probs)).item()
 
             return reinforce_loss, metrics
 

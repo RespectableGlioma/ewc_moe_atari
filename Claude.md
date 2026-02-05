@@ -109,9 +109,26 @@ The stochastic decision point is the VQ codebook selection. But VQ uses argmin (
 3. **`ooc_moe_colab.ipynb`**
    - Mirror changes from train.py
 
+### Implementation Note: Avoiding Stale Gradients
+
+**Problem**: During day phase, we update RSSM parameters (unsupervised loss) after computing selection log_probs. By night, the gradient graph is stale.
+
+**Solution**: Store `(h_state.detach(), code_idx)` during the day, then recompute log_probs at night using current parameters. This gives fresh gradients while preserving the actual selections made.
+
+```python
+# Day phase: store detached state and selection
+selection_data.append((meta_state.h.detach().clone(), game_code.detach().clone()))
+
+# Night phase: recompute log_probs with current params
+for h_state, code_idx in selection_data:
+    prior_logits = self.prior_net(h_state)  # Fresh forward pass
+    log_prob = F.log_softmax(prior_logits, dim=-1)
+    selected_log_prob = log_prob.gather(1, code_idx.unsqueeze(-1))
+```
+
 ### Verification
 
-1. Check that `log_prob` tensors require grad and are connected to RSSM params
+1. No RuntimeError about stale gradients
 2. After training, prior distribution should shift toward codes that led to high rewards
 3. Expert selection should become more consistent (fewer experts for same games)
 4. Performance should improve as RSSM learns better game→expert mappings
