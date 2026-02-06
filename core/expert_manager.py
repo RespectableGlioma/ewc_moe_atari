@@ -3,19 +3,174 @@ ExpertManager: Orchestrates save/load/create logic for experts.
 
 Manages the expert library with epsilon-threshold for novelty detection.
 When a new game embedding is far from all stored experts, creates a new one.
+
+Uses reward-weighted code→expert affinity for learned mappings that become
+"sticky" based on proven performance over time.
 """
 
 import torch
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple, List
 from pathlib import Path
+from collections import defaultdict
+import math
 import time
 import logging
+import random
 
 from .expert import Expert
 from .tiered_store import TieredStore
 
 logger = logging.getLogger(__name__)
+
+
+class CodeExpertAffinity:
+    """
+    Tracks reward-weighted affinity between VQ codes and experts.
+
+    High-performing (code, expert) pairs become "sticky" over time,
+    while poor performers can be displaced by better matches.
+    """
+
+    def __init__(
+        self,
+        ema_alpha: float = 0.1,        # EMA decay for reward tracking
+        stickiness_scale: float = 1.0,  # How much visit count matters
+        exploration_rate: float = 0.1,  # Probability of exploring alternatives
+        min_score_threshold: float = 0.0,  # Minimum score to use affinity
+    ):
+        self.ema_alpha = ema_alpha
+        self.stickiness_scale = stickiness_scale
+        self.exploration_rate = exploration_rate
+        self.min_score_threshold = min_score_threshold
+
+        # affinity[code_idx][expert_id] = {cumulative_reward, visit_count, ema_reward}
+        self.affinity: Dict[int, Dict[str, Dict[str, float]]] = defaultdict(dict)
+
+    def get_best_expert(
+        self,
+        code_idx: int,
+        explore: bool = True,
+    ) -> Tuple[Optional[str], float]:
+        """
+        Get the best expert for a code based on accumulated affinity.
+
+        Args:
+            code_idx: The VQ code index
+            explore: Whether to apply exploration randomness
+
+        Returns:
+            expert_id: Best expert, or None if no affinity exists or exploring
+            score: The affinity score (0 if None)
+        """
+        if code_idx not in self.affinity or not self.affinity[code_idx]:
+            return None, 0.0
+
+        # Compute scores for all experts with affinity to this code
+        scores = {}
+        for expert_id, aff in self.affinity[code_idx].items():
+            # Score = EMA reward * log(visit_count + 1) for stickiness
+            # The log term makes established mappings resistant to change
+            stickiness = math.log(aff['visit_count'] + 1) * self.stickiness_scale
+            scores[expert_id] = aff['ema_reward'] * (1 + stickiness)
+
+        best_expert = max(scores, key=scores.get)
+        best_score = scores[best_expert]
+
+        # Exploration: occasionally try alternatives
+        if explore and random.random() < self.exploration_rate:
+            logger.debug(f"Exploring alternative to {best_expert} for code {code_idx}")
+            return None, 0.0
+
+        # If best score is below threshold, explore via embedding similarity
+        if best_score < self.min_score_threshold:
+            return None, best_score
+
+        return best_expert, best_score
+
+    def update(
+        self,
+        code_idx: int,
+        expert_id: str,
+        reward: float,
+    ):
+        """
+        Update affinity after a game is played.
+
+        Args:
+            code_idx: The VQ code that was active
+            expert_id: The expert that played
+            reward: The game reward achieved
+        """
+        if expert_id not in self.affinity[code_idx]:
+            self.affinity[code_idx][expert_id] = {
+                'cumulative_reward': 0.0,
+                'visit_count': 0,
+                'ema_reward': reward,  # Initialize with first reward
+            }
+
+        aff = self.affinity[code_idx][expert_id]
+        aff['cumulative_reward'] += reward
+        aff['visit_count'] += 1
+        aff['ema_reward'] = (1 - self.ema_alpha) * aff['ema_reward'] + self.ema_alpha * reward
+
+        logger.debug(
+            f"Updated affinity: code {code_idx} -> {expert_id}: "
+            f"ema_reward={aff['ema_reward']:.2f}, visits={aff['visit_count']}"
+        )
+
+    def get_stats(self) -> Dict:
+        """Get affinity statistics."""
+        total_mappings = sum(len(experts) for experts in self.affinity.values())
+        codes_with_affinity = len(self.affinity)
+
+        # Find most established mappings
+        top_mappings = []
+        for code_idx, experts in self.affinity.items():
+            for expert_id, aff in experts.items():
+                score = aff['ema_reward'] * math.log(aff['visit_count'] + 1)
+                top_mappings.append((code_idx, expert_id, aff['visit_count'], aff['ema_reward'], score))
+
+        top_mappings.sort(key=lambda x: x[4], reverse=True)
+
+        return {
+            'total_mappings': total_mappings,
+            'codes_with_affinity': codes_with_affinity,
+            'top_mappings': top_mappings[:10],  # Top 10 by score
+        }
+
+    def to_dict(self) -> Dict:
+        """Serialize for saving."""
+        return {
+            'ema_alpha': self.ema_alpha,
+            'stickiness_scale': self.stickiness_scale,
+            'exploration_rate': self.exploration_rate,
+            'min_score_threshold': self.min_score_threshold,
+            'affinity': {
+                str(code): {
+                    expert_id: dict(aff)
+                    for expert_id, aff in experts.items()
+                }
+                for code, experts in self.affinity.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'CodeExpertAffinity':
+        """Deserialize from saved data."""
+        obj = cls(
+            ema_alpha=data.get('ema_alpha', 0.1),
+            stickiness_scale=data.get('stickiness_scale', 1.0),
+            exploration_rate=data.get('exploration_rate', 0.1),
+            min_score_threshold=data.get('min_score_threshold', 0.0),
+        )
+
+        for code_str, experts in data.get('affinity', {}).items():
+            code_idx = int(code_str)
+            for expert_id, aff in experts.items():
+                obj.affinity[code_idx][expert_id] = dict(aff)
+
+        return obj
 
 
 class ExpertManager:
@@ -37,6 +192,10 @@ class ExpertManager:
         obs_shape: Tuple[int, ...] = (4, 84, 84),
         max_experts_in_memory: int = 2,  # Active + prefetched
         unified_action_space=None,
+        # Affinity parameters
+        affinity_ema_alpha: float = 0.1,
+        affinity_stickiness: float = 1.0,
+        affinity_exploration: float = 0.1,
     ):
         self.device = device
         self.epsilon = epsilon
@@ -50,8 +209,12 @@ class ExpertManager:
         # Tiered storage for experts
         self.storage = TieredStore(storage_path)
 
-        # Expert registry: code_idx -> expert_id mapping
-        self.code_to_expert: Dict[int, str] = {}
+        # Reward-weighted code→expert affinity (replaces hard code_to_expert mapping)
+        self.code_affinity = CodeExpertAffinity(
+            ema_alpha=affinity_ema_alpha,
+            stickiness_scale=affinity_stickiness,
+            exploration_rate=affinity_exploration,
+        )
 
         # Embedding centroids for each expert (for similarity matching)
         # expert_id -> centroid embedding
@@ -63,12 +226,18 @@ class ExpertManager:
         self.prefetched_expert: Optional[Expert] = None
         self.prefetched_expert_id: Optional[str] = None
 
+        # Track current selection for affinity update
+        self.current_code_idx: Optional[int] = None
+
         # Statistics
         self.stats = {
             'total_experts_created': 0,
             'total_swaps': 0,
             'cache_hits': 0,
             'cache_misses': 0,
+            'affinity_selections': 0,
+            'embedding_selections': 0,
+            'new_expert_creations': 0,
         }
 
         # Load existing registry if present
@@ -78,23 +247,24 @@ class ExpertManager:
         """Load expert registry from storage."""
         registry = self.storage.load_registry()
         if registry:
-            self.code_to_expert = registry.get('code_to_expert', {})
-            # Convert string keys back to int
-            self.code_to_expert = {
-                int(k): v for k, v in self.code_to_expert.items()
-            }
+            # Load affinity data
+            affinity_data = registry.get('code_affinity', None)
+            if affinity_data:
+                self.code_affinity = CodeExpertAffinity.from_dict(affinity_data)
+                logger.info(f"Loaded affinity with {self.code_affinity.get_stats()['total_mappings']} mappings")
+
             # Load centroids
             centroids_data = registry.get('expert_centroids', {})
             for expert_id, centroid_list in centroids_data.items():
                 self.expert_centroids[expert_id] = torch.tensor(
                     centroid_list, device=self.device
                 )
-            logger.info(f"Loaded registry with {len(self.code_to_expert)} experts")
+            logger.info(f"Loaded registry with {len(self.expert_centroids)} expert centroids")
 
     def _save_registry(self):
         """Save expert registry to storage."""
         registry = {
-            'code_to_expert': {str(k): v for k, v in self.code_to_expert.items()},
+            'code_affinity': self.code_affinity.to_dict(),
             'expert_centroids': {
                 k: v.cpu().tolist() for k, v in self.expert_centroids.items()
             },
@@ -163,7 +333,8 @@ class ExpertManager:
         """
         Retrieve existing expert or create new one based on embedding.
 
-        This is the main entry point for expert management during gameplay.
+        Uses reward-weighted affinity for code→expert mapping, falling back
+        to embedding similarity when exploring or when no affinity exists.
 
         Args:
             embedding: (code_dim,) game embedding from meta-agent
@@ -172,10 +343,29 @@ class ExpertManager:
         Returns:
             Expert to use for this game
         """
-        # First check code-based lookup if available
-        if code_idx is not None and code_idx in self.code_to_expert:
-            expert_id = self.code_to_expert[code_idx]
+        # Store code_idx for later affinity update
+        self.current_code_idx = code_idx
 
+        expert_id = None
+
+        # First, try affinity-based selection if code is available
+        if code_idx is not None:
+            expert_id, affinity_score = self.code_affinity.get_best_expert(code_idx)
+
+            if expert_id is not None:
+                logger.info(f"Affinity selected {expert_id} for code {code_idx} (score={affinity_score:.3f})")
+                self.stats['affinity_selections'] += 1
+
+        # If no affinity match, try embedding similarity
+        if expert_id is None:
+            expert_id, similarity = self.find_similar_expert(embedding)
+
+            if expert_id is not None:
+                logger.info(f"Embedding selected {expert_id} (sim={similarity:.3f})")
+                self.stats['embedding_selections'] += 1
+
+        # If we found an expert, load it
+        if expert_id is not None:
             # Check if already loaded
             if expert_id == self.active_expert_id:
                 self.stats['cache_hits'] += 1
@@ -183,7 +373,6 @@ class ExpertManager:
 
             if expert_id == self.prefetched_expert_id:
                 self.stats['cache_hits'] += 1
-                # Swap prefetched to active
                 self._swap_prefetched_to_active()
                 return self.active_expert
 
@@ -191,34 +380,13 @@ class ExpertManager:
             self.stats['cache_misses'] += 1
             return self._load_expert(expert_id)
 
-        # Embedding-based similarity search
-        expert_id, similarity = self.find_similar_expert(embedding)
-
-        if expert_id is not None:
-            logger.info(f"Found similar expert {expert_id} (sim={similarity:.3f})")
-
-            if expert_id == self.active_expert_id:
-                self.stats['cache_hits'] += 1
-                return self.active_expert
-
-            if expert_id == self.prefetched_expert_id:
-                self.stats['cache_hits'] += 1
-                self._swap_prefetched_to_active()
-                return self.active_expert
-
-            self.stats['cache_misses'] += 1
-            return self._load_expert(expert_id)
-
-        # No similar expert found - create new one
-        logger.info(f"No similar expert found (best sim={similarity:.3f}), creating new")
+        # No expert found - create new one
+        logger.info(f"No suitable expert found, creating new")
         expert = self.create_expert()
+        self.stats['new_expert_creations'] += 1
 
         # Register embedding as centroid for new expert
         self.expert_centroids[expert.expert_id] = embedding.detach().clone()
-
-        # Register code mapping if available
-        if code_idx is not None:
-            self.code_to_expert[code_idx] = expert.expert_id
 
         # Set as active
         self._save_current_expert()
@@ -228,6 +396,25 @@ class ExpertManager:
         self._save_registry()
 
         return expert
+
+    def update_affinity(self, reward: float, code_idx: Optional[int] = None):
+        """
+        Update code→expert affinity based on game reward.
+
+        Call this after each game with the reward achieved.
+
+        Args:
+            reward: The reward achieved in the game
+            code_idx: The code that was used (uses stored current_code_idx if None)
+        """
+        if code_idx is None:
+            code_idx = self.current_code_idx
+
+        if code_idx is None or self.active_expert_id is None:
+            return
+
+        self.code_affinity.update(code_idx, self.active_expert_id, reward)
+        logger.debug(f"Updated affinity: code {code_idx} -> {self.active_expert_id}, reward={reward:.1f}")
 
     def _load_expert(self, expert_id: str) -> Expert:
         """Load expert from storage."""
@@ -330,23 +517,25 @@ class ExpertManager:
         else:
             self.expert_centroids[expert_id] = embedding.detach().clone()
 
-    def register_code_mapping(self, code_idx: int, expert_id: str):
-        """Register a mapping from code index to expert."""
-        self.code_to_expert[code_idx] = expert_id
-        self._save_registry()
-
     def get_active_expert(self) -> Optional[Expert]:
         """Get currently active expert."""
         return self.active_expert
 
     def get_stats(self) -> dict:
         """Get manager statistics."""
+        affinity_stats = self.code_affinity.get_stats()
         return {
             **self.stats,
             'num_experts_stored': len(self.expert_centroids),
             'active_expert': self.active_expert_id,
             'prefetched_expert': self.prefetched_expert_id,
+            'affinity_mappings': affinity_stats['total_mappings'],
+            'codes_with_affinity': affinity_stats['codes_with_affinity'],
         }
+
+    def get_affinity_stats(self) -> dict:
+        """Get detailed affinity statistics."""
+        return self.code_affinity.get_stats()
 
     def save_all(self):
         """Save all state to storage."""

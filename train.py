@@ -232,6 +232,10 @@ class DayNightTrainer:
                 game_embedding.squeeze(0),
             )
 
+            # Update code→expert affinity based on game reward
+            game_reward = sum(game_rewards) if game_rewards else 0
+            self.expert_manager.update_affinity(game_reward, code_idx=game_code_int)
+
             # Meta-agent unsupervised learning on trajectory
             meta_loss, meta_metrics = self._train_meta_step(obs)
             meta_losses.append(meta_loss)

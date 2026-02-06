@@ -135,6 +135,50 @@ for h_state, code_idx in selection_data:
 
 ---
 
+---
+
+## Reward-Weighted Code→Expert Affinity
+
+### Problem
+
+The original hard `code_to_expert[code] = expert_id` mapping was permanent once created. If code 17 got mapped to expert_0000 on day 1, every future occurrence of code 17 would load expert_0000 — even if that expert was trained on a different game.
+
+### Solution
+
+Replace hard mappings with **reward-weighted affinity** that learns from experience:
+
+```python
+affinity[code][expert] = {
+    'cumulative_reward': 0.0,    # Total reward when this pair was used
+    'visit_count': 0,            # How many times this pair was selected
+    'ema_reward': 0.0,           # Exponential moving average of rewards
+}
+```
+
+**Selection formula:**
+```python
+score = ema_reward * (1 + log(visit_count + 1) * stickiness_scale)
+```
+
+- High EMA reward → this expert performs well on this code
+- High visit count → "stickiness" — established mappings are resistant to change
+- Exploration rate (10%) → occasionally try alternatives
+
+### Key Properties
+
+1. **Learning from reward**: Good (code, expert) pairs accumulate positive affinity
+2. **Stickiness grows with evidence**: `log(visit_count)` makes proven mappings harder to displace
+3. **Poor performers can be replaced**: Low EMA reward means another expert can take over
+4. **Exploration**: 10% chance to try embedding similarity instead of affinity
+5. **Graceful fallback**: New codes with no affinity use embedding similarity
+
+### Files Changed
+
+- `core/expert_manager.py`: Added `CodeExpertAffinity` class, modified `retrieve_or_create()` to use affinity-based selection, added `update_affinity()` method
+- `train.py` / notebook: Call `expert_manager.update_affinity(game_reward)` after each game
+
+---
+
 ## Future Consideration: Gumbel-Softmax
 
 If REINFORCE has high variance or slow convergence, consider:
