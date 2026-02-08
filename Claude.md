@@ -212,6 +212,59 @@ This would allow end-to-end gradients from expert value estimates through code s
 
 ---
 
+---
+
+## Expert Pruning
+
+### Problem
+
+Training creates many undertrained experts due to:
+1. VQ code clustering creating new codes for visually similar observations
+2. Low epsilon threshold spawning new experts instead of reusing existing ones
+3. Curriculum randomness spreading training across many experts
+
+Result: 31 experts for 8 games, with many having only ~12.8K frames (essentially 1 game visit).
+
+### Solution
+
+Added `prune_experts()` method to ExpertManager that removes undertrained experts based on:
+- **min_frames**: Minimum training frames required (default: 25,000 = ~2 game visits)
+- **min_affinity_score**: Minimum affinity score to keep (default: 0.0)
+- **max_experts**: Optional hard cap on expert count
+
+```python
+result = expert_manager.prune_experts(
+    min_frames=25000,
+    min_affinity_score=0.0,
+    max_experts=None,  # Optional cap
+    dry_run=True,      # Set False to actually delete
+)
+```
+
+### Pruning Logic
+
+1. Compute composite score for each expert: `frames * (1 + max_affinity_score)`
+2. Experts meeting EITHER threshold (frames OR affinity) are kept
+3. Active/prefetched experts are protected from pruning
+4. When deleting an expert:
+   - Remove from centroids dict
+   - Clean affinity mappings for that expert
+   - Optionally redistribute affinity to most similar remaining expert
+   - Delete from disk storage
+
+### Integration
+
+- **Periodic**: Every 50 days during training, prune experts with <25K frames
+- **Post-training**: Dedicated notebook cells for analysis and manual pruning
+- **Dry run**: Always available to preview what would be pruned
+
+### Files Changed
+
+- `core/expert_manager.py`: Added `get_expert_stats()`, `prune_experts()`, `_delete_expert()` methods
+- `ooc_moe_colab.ipynb`: Added pruning during training loop and dedicated analysis cells
+
+---
+
 ## Other Notes
 
 - Unified action space implemented: 6 actions for Breakout+Pong+SpaceInvaders, ~18 for full 8-game set

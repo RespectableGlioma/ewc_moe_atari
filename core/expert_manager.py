@@ -546,3 +546,193 @@ class ExpertManager:
     def list_experts(self) -> List[str]:
         """List all stored expert IDs."""
         return list(self.expert_centroids.keys())
+
+    def get_expert_stats(self) -> Dict[str, Dict]:
+        """
+        Get statistics for all experts (loads metadata from storage).
+
+        Returns:
+            Dict mapping expert_id to stats dict with:
+            - total_frames: training frames
+            - total_episodes: episodes trained
+            - games_trained: list of game names
+            - best_episode_reward: highest reward achieved
+            - max_affinity_score: highest affinity score across all codes
+            - total_affinity_visits: total visits across all code mappings
+        """
+        expert_stats = {}
+
+        for expert_id in self.list_experts():
+            stats = {
+                'total_frames': 0,
+                'total_episodes': 0,
+                'games_trained': [],
+                'best_episode_reward': float('-inf'),
+                'max_affinity_score': 0.0,
+                'total_affinity_visits': 0,
+            }
+
+            # Load metadata from storage
+            data = self.storage.load_expert(expert_id)
+            if data and 'metadata' in data:
+                meta = data['metadata']
+                stats['total_frames'] = meta.get('total_frames', 0)
+                stats['total_episodes'] = meta.get('total_episodes', 0)
+                stats['games_trained'] = meta.get('games_trained', [])
+                stats['best_episode_reward'] = meta.get('best_episode_reward', float('-inf'))
+
+            # Compute affinity stats
+            for code_idx, experts in self.code_affinity.affinity.items():
+                if expert_id in experts:
+                    aff = experts[expert_id]
+                    stickiness = math.log(aff['visit_count'] + 1) * self.code_affinity.stickiness_scale
+                    score = aff['ema_reward'] * (1 + stickiness)
+                    stats['max_affinity_score'] = max(stats['max_affinity_score'], score)
+                    stats['total_affinity_visits'] += aff['visit_count']
+
+            expert_stats[expert_id] = stats
+
+        return expert_stats
+
+    def prune_experts(
+        self,
+        min_frames: int = 50000,
+        min_affinity_score: float = 0.0,
+        max_experts: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> Dict:
+        """
+        Prune undertrained experts to reduce fragmentation.
+
+        Experts are removed if they have:
+        - Fewer than min_frames training frames, AND
+        - Max affinity score below min_affinity_score
+
+        Optionally, can also enforce a max_experts limit by removing
+        the lowest-scoring experts until the limit is met.
+
+        Args:
+            min_frames: Minimum training frames to keep expert
+            min_affinity_score: Minimum affinity score to keep expert
+            max_experts: Optional maximum number of experts to keep
+            dry_run: If True, just report what would be pruned
+
+        Returns:
+            Dict with pruning results:
+            - pruned: list of pruned expert IDs
+            - kept: list of kept expert IDs
+            - protected: list of protected expert IDs (active/prefetched)
+        """
+        expert_stats = self.get_expert_stats()
+
+        # Compute composite score for each expert
+        # Score = frames * (1 + max_affinity_score) to favor both training and good performance
+        scored_experts = []
+        for expert_id, stats in expert_stats.items():
+            composite_score = stats['total_frames'] * (1 + max(0, stats['max_affinity_score']))
+            scored_experts.append((expert_id, stats, composite_score))
+
+        # Sort by score descending
+        scored_experts.sort(key=lambda x: x[2], reverse=True)
+
+        # Determine which experts to prune
+        protected = set()
+        if self.active_expert_id:
+            protected.add(self.active_expert_id)
+        if self.prefetched_expert_id:
+            protected.add(self.prefetched_expert_id)
+
+        to_prune = []
+        to_keep = []
+
+        for expert_id, stats, score in scored_experts:
+            if expert_id in protected:
+                to_keep.append(expert_id)
+                continue
+
+            # Check if expert meets minimum requirements
+            meets_frames = stats['total_frames'] >= min_frames
+            meets_affinity = stats['max_affinity_score'] >= min_affinity_score
+
+            # Keep if meets either threshold (frames OR affinity)
+            if meets_frames or meets_affinity:
+                to_keep.append(expert_id)
+            else:
+                to_prune.append(expert_id)
+
+        # If max_experts is set, also prune lowest-scoring non-protected experts
+        if max_experts is not None:
+            current_count = len(to_keep)
+            if current_count > max_experts:
+                # Already keeping too many, need to prune more
+                # Sort kept experts by score and move lowest to prune list
+                kept_with_scores = [
+                    (eid, next(s for e, s, _ in scored_experts if e == eid))
+                    for eid in to_keep if eid not in protected
+                ]
+                kept_with_scores.sort(
+                    key=lambda x: x[1]['total_frames'] * (1 + max(0, x[1]['max_affinity_score']))
+                )
+
+                excess = current_count - max_experts
+                for eid, _ in kept_with_scores[:excess]:
+                    to_keep.remove(eid)
+                    to_prune.append(eid)
+
+        if not dry_run and to_prune:
+            for expert_id in to_prune:
+                self._delete_expert(expert_id)
+            logger.info(f"Pruned {len(to_prune)} experts: {to_prune}")
+
+        return {
+            'pruned': to_prune,
+            'kept': to_keep,
+            'protected': list(protected),
+            'total_before': len(expert_stats),
+            'total_after': len(to_keep),
+        }
+
+    def _delete_expert(self, expert_id: str):
+        """
+        Delete an expert and clean up all references.
+
+        Redistributes affinity mappings to remaining similar experts.
+        """
+        # Remove from centroids
+        if expert_id in self.expert_centroids:
+            deleted_centroid = self.expert_centroids.pop(expert_id)
+        else:
+            deleted_centroid = None
+
+        # Remove from affinity mappings
+        # For each code that mapped to this expert, remove the mapping
+        # The next selection will fall back to embedding similarity
+        codes_to_clean = []
+        for code_idx, experts in self.code_affinity.affinity.items():
+            if expert_id in experts:
+                codes_to_clean.append((code_idx, experts[expert_id]))
+
+        for code_idx, old_aff in codes_to_clean:
+            del self.code_affinity.affinity[code_idx][expert_id]
+            logger.debug(f"Removed affinity mapping: code {code_idx} -> {expert_id}")
+
+            # Optionally: redistribute affinity to most similar remaining expert
+            if deleted_centroid is not None and self.expert_centroids:
+                similar_expert, similarity = self.find_similar_expert(deleted_centroid)
+                if similar_expert is not None and similarity > 0.5:
+                    # Transfer some affinity to similar expert
+                    if similar_expert not in self.code_affinity.affinity[code_idx]:
+                        self.code_affinity.affinity[code_idx][similar_expert] = {
+                            'cumulative_reward': 0.0,
+                            'visit_count': 0,
+                            'ema_reward': old_aff['ema_reward'] * 0.5,  # Discount transferred affinity
+                        }
+                    logger.debug(f"Transferred affinity from {expert_id} to {similar_expert} for code {code_idx}")
+
+        # Delete from storage
+        self.storage.delete_expert(expert_id)
+
+        # Save updated registry
+        self._save_registry()
+
+        logger.info(f"Deleted expert {expert_id}")
