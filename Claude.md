@@ -132,19 +132,26 @@ for game in curriculum.sample(K):
     meta_loss.backward()
 ```
 
-### Night Phase (Meta-Agent REINFORCE)
+### Night Phase (Meta-Agent REINFORCE with Per-Selection Credit)
 ```python
-# Recompute log_probs with current parameters (avoid stale gradients)
-for h_state, code_idx in selection_data:
+# Per-selection credit assignment: each code selection gets its own advantage
+for h_state, code_idx, game_reward in selection_data:
+    # Per-selection advantage (not day-level!)
+    advantage = game_reward - baseline
+
+    # Recompute log_prob with current parameters
     prior_logits = meta_agent.prior_net(h_state)
     log_prob = F.log_softmax(prior_logits, dim=-1)
-    log_probs.append(log_prob.gather(1, code_idx))
+    selected_log_prob = log_prob.gather(1, code_idx)
 
-# REINFORCE: encourage selections that led to high reward
-advantage = cumulative_reward - baseline
-reinforce_loss = -advantage * sum(log_probs)
+    # Per-selection REINFORCE loss
+    losses.append(-advantage * selected_log_prob)
+
+reinforce_loss = sum(losses)
 reinforce_loss.backward()
 ```
+
+**Key insight**: Previously all K selections in a day received the same advantage signal (day-level cumulative reward). Now each selection's gradient is scaled by its own game's reward, giving proper credit assignment.
 
 ---
 
@@ -255,9 +262,10 @@ def prune_experts(min_frames=25000, min_affinity_score=0.0, dry_run=True):
 ### 1. Address Mode Collapse
 
 The meta-agent learned to route everything to one expert. Options:
-- **Entropy bonus** in REINFORCE to encourage diverse selections
+- **Entropy bonus** in REINFORCE loss to encourage diverse code selections
 - **Annealed exploration** in affinity (start high, decay over training)
-- **Per-game routing constraints** ensuring each game has dedicated expert capacity
+- **Load balancing loss** penalizing uneven expert utilization (soft, learned)
+- ✅ **Per-selection credit assignment** — IMPLEMENTED: each code selection now receives its own advantage based on the game's reward, not day-level cumulative reward
 
 ### 2. Gumbel-Softmax for End-to-End Gradients
 

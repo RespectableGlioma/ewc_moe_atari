@@ -128,12 +128,12 @@ class DayNightTrainer:
         Run one day of training: K games with expert training.
 
         Returns:
-            Day statistics including selection_log_probs for REINFORCE
+            Day statistics including selection_data for per-selection REINFORCE
         """
         day_rewards = []
         day_frames = 0
         meta_losses = []
-        selection_data = []  # Track (h_state, code_idx) for REINFORCE
+        selection_data = []  # Track (h_state, code_idx, game_reward) for per-selection REINFORCE
 
         # Meta-agent state
         meta_state = self.meta_agent.init_state(1, self.device)
@@ -151,9 +151,9 @@ class DayNightTrainer:
             game_embedding = self.meta_agent.get_game_embedding(meta_state)
             game_code = self.meta_agent.get_game_code(meta_state)  # Keep as tensor
 
-            # Store (h_state, code_idx) for REINFORCE - detach h to avoid graph issues
-            # We'll recompute log_probs at night with current parameters
-            selection_data.append((meta_state.h.detach().clone(), game_code.detach().clone()))
+            # Store h_state and code_idx for later (we'll add reward after training)
+            h_state_for_reinforce = meta_state.h.detach().clone()
+            code_idx_for_reinforce = game_code.detach().clone()
 
             game_code_int = game_code.item()  # Convert to int for expert manager
 
@@ -235,6 +235,9 @@ class DayNightTrainer:
             # Update code→expert affinity based on game reward
             game_reward = sum(game_rewards) if game_rewards else 0
             self.expert_manager.update_affinity(game_reward, code_idx=game_code_int)
+
+            # Store selection with its reward for per-selection REINFORCE credit assignment
+            selection_data.append((h_state_for_reinforce, code_idx_for_reinforce, game_reward))
 
             # Meta-agent unsupervised learning on trajectory
             meta_loss, meta_metrics = self._train_meta_step(obs)
