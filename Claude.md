@@ -1,272 +1,334 @@
-# Out-of-Core MoE Atari - Development Notes
+# Out-of-Core Mixture of Experts for Continual Atari Learning
 
-## Architecture Overview
+## Project Overview
 
-Hierarchical Mixture of Experts for continual learning across Atari games:
-- **Meta-Agent (RSSM)**: Always in GPU memory, detects game changes, selects experts
-- **Expert Library**: Game-playing experts stored on disk, swapped in/out
-- **Day/Night Cycle**: Day = play K games with expert training; Night = meta-agent update
+This project explores **continual learning** across multiple Atari games using a hierarchical Mixture of Experts (MoE) architecture. The core idea: instead of training one monolithic network on all games (which suffers from catastrophic forgetting) or separate networks per game (which doesn't scale), we use a small meta-agent to dynamically route observations to specialized experts stored on disk.
 
-## Current Issue: RSSM Not Learning Expert Selection
+### The Continual Learning Problem
 
-**Problem**: The RSSM's `night_update()` computes an advantage but never applies a gradient. Expert selection is effectively random with respect to reward signal.
+When neural networks learn task B after task A, they typically forget task A — this is **catastrophic forgetting**. Standard approaches:
+- **Regularization** (EWC, SI): Penalize changes to important weights → limited capacity
+- **Replay buffers**: Store old examples → memory overhead, privacy concerns
+- **Architecture growth**: Add capacity per task → unbounded growth
 
-The RSSM is trained on unsupervised losses only:
-1. KL divergence (prior vs posterior) - learns to predict game from dynamics
-2. VQ commitment loss - learns discrete codebook
-3. Transition prediction - learns game switch patterns
+### Our Approach: Hierarchical Out-of-Core MoE
 
-**Missing**: Gradient signal connecting expert selection → reward outcome
+We separate **what to do** (experts) from **when to do it** (meta-agent):
+
+```
+┌─────────────────────────────────────────┐
+│  Meta-Agent (GPU) - Always Resident     │
+│  • Encodes observations to game codes   │
+│  • Detects game switches via KL spike   │
+│  • Routes to appropriate expert         │
+└──────────────────┬──────────────────────┘
+                   │ selects
+                   ▼
+┌─────────────────────────────────────────┐
+│  Active Expert (GPU) - Swappable        │
+│  • Full actor-critic network            │
+│  • Trained with PPO on current game     │
+└──────────────────┬──────────────────────┘
+                   │ swap in/out
+                   ▼
+┌─────────────────────────────────────────┐
+│  Expert Library (Disk/NVMe)             │
+│  • expert_0000.pt, expert_0001.pt, ...  │
+│  • Indexed by learned VQ codes          │
+└─────────────────────────────────────────┘
+```
+
+**Key insight**: The meta-agent is tiny (~1M params) and learns game-identity, not game-playing. Experts are large (~2M params each) but only one is in GPU memory at a time. This allows scaling to many games without proportional GPU memory growth.
 
 ---
 
-## Dev Plan: REINFORCE for Expert Selection
+## Architecture
 
-### Goal
-Backpropagate reward signal through expert selection decisions so the RSSM learns which embeddings lead to good expert-game matches.
+### Meta-Agent (MetaRSSM)
 
-### Design
+A Recurrent State-Space Model that compresses observations into discrete game codes:
 
-**Day Phase Changes:**
-1. When RSSM produces a game embedding, compute log probability of the selected expert under the current policy
-2. Store `(log_prob, expert_id, game_name)` for each expert selection during the day
-3. Track per-game rewards separately
-
-**Night Phase Changes:**
-1. Compute advantage = cumulative_reward - baseline (already done)
-2. Compute REINFORCE loss: `-advantage * sum(log_probs)`
-3. Backprop through RSSM and update parameters
-
-### Key Question: What is the "action" and "policy"?
-
-Current flow:
 ```
-obs → RSSM.encoder → posterior_net → VQ quantize → code_idx
-                                                      ↓
-                                          expert_manager.retrieve_or_create(embedding, code_idx)
-                                                      ↓
-                                          cosine similarity → select expert
+obs(t) → CNN Encoder → e(t)
+                         ↓
+           GRU(e(t), z(t-1), h(t-1)) → h(t)
+                                        ↓
+                    Posterior: q(z|h,e) → VQ Quantize → z(t), code_idx
+                    Prior:     p(z|h)   → distribution over codes
 ```
 
-The stochastic decision point is the VQ codebook selection. But VQ uses argmin (deterministic), so we need to either:
+**Components:**
+- **CNN Encoder**: Nature DQN architecture, extracts visual features
+- **GRU**: Maintains temporal context across observations
+- **VQ Codebook**: 64 discrete "game prototype" embeddings
+- **Prior Network**: Predicts code from dynamics alone (for REINFORCE)
+- **Posterior Network**: Infers code given observation (for VQ selection)
 
-**Option A: Treat prior distribution as policy**
-- Prior network outputs `p(code | h_t)` as softmax over codebook
-- Use this as the policy for REINFORCE
-- Log prob = `log prior_probs[selected_code_idx]`
-- Pro: Clean separation, prior learns to predict good codes
-- Con: Posterior (which actually selects) may diverge from prior
+**Switch Detection**: KL divergence between prior and posterior spikes when the game changes — the prior (based on dynamics) expects one game, but the posterior (seeing the observation) infers a different one.
 
-**Option B: Add stochasticity to posterior**
-- Sample from posterior distribution instead of VQ argmin
-- Log prob = log probability of sampled code
-- Pro: Direct gradient through actual selection
-- Con: Changes inference behavior, may destabilize VQ
+### Experts
 
-**Option C: Gumbel-softmax (future consideration)**
-- Replace VQ hard selection with Gumbel-softmax relaxation
-- Allows straight-through gradients from expert performance
-- Pro: End-to-end differentiable
-- Con: More complex, changes codebook dynamics
+Standard actor-critic networks with Nature CNN backbone:
 
-**Decision: Start with Option A** (prior as policy)
-- Minimal code changes
-- Prior already exists and outputs code distribution
-- Night update encourages prior to assign high probability to codes that led to good rewards
-- Can swap to Gumbel-softmax later if needed
+- **Backbone**: 3-layer CNN → 512-dim features
+- **Actor**: MLP → policy logits over unified action space
+- **Critic**: MLP → value estimate
+- **Metadata**: Tracks games trained, total frames, best reward
 
-### Implementation Plan
+### Expert Manager
 
-#### 1. Modify MetaRSSM
-- Add `get_selection_log_prob(state, code_idx)` method
-- Returns `log p(code_idx | h)` from prior network
+Orchestrates expert lifecycle with two selection mechanisms:
 
-#### 2. Modify DayNightTrainer / Notebook Training Loop
-- Create `day_selections: List[Tuple[log_prob, reward]]` buffer
-- After each expert selection, store `log_prob = meta_agent.get_selection_log_prob(state, code_idx)`
-- After each game, associate stored log_probs with game reward
+1. **Reward-Weighted Affinity**: Learned code→expert mappings based on performance
+   ```python
+   score = ema_reward * (1 + log(visit_count + 1) * stickiness)
+   ```
 
-#### 3. Modify night_update()
-- Accept list of (log_prob, reward) tuples
-- Compute per-selection advantages (reward - baseline)
-- Compute REINFORCE loss: `-mean(advantage * log_prob)`
-- Return loss for external optimizer step (or do internal step)
+2. **Embedding Similarity**: Fallback using cosine similarity to expert centroids
 
-#### 4. Update Training Loop
-- Call `meta_optimizer.zero_grad()` before night_update
-- Call `loss.backward()` and `meta_optimizer.step()` after
+### Unified Action Space
 
-### Files to Modify
+Different Atari games have different action sets. We build a union:
 
-1. **`core/meta_rssm.py`**
-   - Add `get_selection_log_prob(self, state, code_idx) -> torch.Tensor`
-   - Modify `night_update()` to compute and return REINFORCE loss
+| Unified Idx | Semantic    | Breakout | Pong | SpaceInvaders |
+|-------------|-------------|----------|------|---------------|
+| 0           | NOOP        | ✓        | ✓    | ✓             |
+| 1           | FIRE        | ✓        | ✓    | ✓             |
+| 2           | RIGHT       | ✓        | ✓    | ✓             |
+| 3           | LEFT        | ✓        | ✓    | ✓             |
+| 4           | RIGHTFIRE   | ✗        | ✓    | ✓             |
+| 5           | LEFTFIRE    | ✗        | ✓    | ✓             |
 
-2. **`train.py`**
-   - Track selection log_probs during day phase
-   - Pass to night_update, apply gradient
+Per-game masks set invalid logits to `-inf` before sampling.
 
-3. **`ooc_moe_colab.ipynb`**
-   - Mirror changes from train.py
+---
 
-### Implementation Note: Avoiding Stale Gradients
+## Training Loop: Day/Night Cycle
 
-**Problem**: During day phase, we update RSSM parameters (unsupervised loss) after computing selection log_probs. By night, the gradient graph is stale.
-
-**Solution**: Store `(h_state.detach(), code_idx)` during the day, then recompute log_probs at night using current parameters. This gives fresh gradients while preserving the actual selections made.
-
+### Day Phase (Expert Training)
 ```python
-# Day phase: store detached state and selection
-selection_data.append((meta_state.h.detach().clone(), game_code.detach().clone()))
+for game in curriculum.sample(K):
+    obs = env.reset()
 
-# Night phase: recompute log_probs with current params
+    # Meta-agent encodes observation
+    meta_state, outputs = meta_agent(obs, meta_state)
+    code_idx = meta_agent.get_game_code(meta_state)
+
+    # Store (h, code) for REINFORCE
+    selection_data.append((meta_state.h.detach(), code_idx.detach()))
+
+    # Retrieve expert via affinity or similarity
+    expert = expert_manager.retrieve_or_create(embedding, code_idx)
+
+    # Train expert with PPO
+    for _ in range(updates_per_game):
+        obs, metrics = ppo_trainer.step(env, obs, game_name)
+
+    # Update affinity based on game reward
+    expert_manager.update_affinity(game_reward, code_idx)
+
+    # Meta-agent unsupervised update (KL + VQ + transition prediction)
+    meta_loss = meta_agent.compute_loss(trajectory)
+    meta_loss.backward()
+```
+
+### Night Phase (Meta-Agent REINFORCE)
+```python
+# Recompute log_probs with current parameters (avoid stale gradients)
 for h_state, code_idx in selection_data:
-    prior_logits = self.prior_net(h_state)  # Fresh forward pass
+    prior_logits = meta_agent.prior_net(h_state)
     log_prob = F.log_softmax(prior_logits, dim=-1)
-    selected_log_prob = log_prob.gather(1, code_idx.unsqueeze(-1))
+    log_probs.append(log_prob.gather(1, code_idx))
+
+# REINFORCE: encourage selections that led to high reward
+advantage = cumulative_reward - baseline
+reinforce_loss = -advantage * sum(log_probs)
+reinforce_loss.backward()
 ```
 
-### Verification
+---
 
-1. No RuntimeError about stale gradients
-2. After training, prior distribution should shift toward codes that led to high rewards
-3. Expert selection should become more consistent (fewer experts for same games)
-4. Performance should improve as RSSM learns better game→expert mappings
+## What Was Built
+
+### Core Modules (`core/`)
+
+| File | Purpose |
+|------|---------|
+| `meta_rssm.py` | MetaRSSM with VQ codebook, KL switch detection, REINFORCE support |
+| `expert.py` | Actor-critic expert with unified action masking |
+| `expert_manager.py` | Expert lifecycle, affinity-based selection, pruning |
+| `tiered_store.py` | Disk storage with CPU cache and async loading |
+
+### Training (`training/`)
+
+| File | Purpose |
+|------|---------|
+| `ppo_trainer.py` | PPO with GAE, unified action space integration |
+| `rollout_buffer.py` | Experience storage for PPO updates |
+
+### Environments (`envs/`)
+
+| File | Purpose |
+|------|---------|
+| `atari_wrappers.py` | Standard Atari preprocessing (frame stack, resize, etc.) |
+| `game_curriculum.py` | Random/Markov/Periodic game scheduling |
+| `action_space.py` | UnifiedActionSpace with per-game masks |
+
+### Entry Points
+
+| File | Purpose |
+|------|---------|
+| `train.py` | Full training script with CLI args |
+| `ooc_moe_colab.ipynb` | Interactive notebook for Colab with checkpointing |
 
 ---
 
+## Training Results
+
+### 300-Day Run (8 Games, 19.2M Frames)
+
+```
+Total experts: 20
+Affinity selections: 1322 (89%)
+Embedding selections: 158 (11%)
+
+Top Expert: expert_0015
+  - 14.8M frames (77% of all training)
+  - Trained on: Frostbite, Pong, Seaquest, BeamRider, Breakout, Qbert, SpaceInvaders, Enduro
+```
+
+**Observations:**
+1. **Affinity dominates**: System learned to use reward-based routing over similarity
+2. **Mode collapse**: Meta-agent converged to routing most observations to one expert
+3. **Pruning works**: Reduced from 31 to 20 experts during training
+4. **REINFORCE converged**: Mean log prob reached -0.0038 (very confident selections)
+
+### Known Issues
+
+1. **Extreme concentration**: One expert receives most training, others starve
+2. **Undertrained experts**: 8 experts with only 12.8K frames (1 game visit)
+3. **Pong stuck at -21**: Sparse reward + long horizon makes learning difficult
+
 ---
 
-## Reward-Weighted Code→Expert Affinity
+## Implementation Details
 
-### Problem
+### Avoiding Stale Gradients
 
-The original hard `code_to_expert[code] = expert_id` mapping was permanent once created. If code 17 got mapped to expert_0000 on day 1, every future occurrence of code 17 would load expert_0000 — even if that expert was trained on a different game.
+During day phase, we update RSSM parameters after computing selection log_probs. By night, the gradient graph is stale.
 
-### Solution
+**Solution**: Store `(h_state.detach(), code_idx)` during day, recompute log_probs at night with current parameters.
 
-Replace hard mappings with **reward-weighted affinity** that learns from experience:
+### Affinity-Based Expert Selection
 
 ```python
-affinity[code][expert] = {
-    'cumulative_reward': 0.0,    # Total reward when this pair was used
-    'visit_count': 0,            # How many times this pair was selected
-    'ema_reward': 0.0,           # Exponential moving average of rewards
-}
+class CodeExpertAffinity:
+    def get_best_expert(self, code_idx):
+        for expert_id, aff in self.affinity[code_idx].items():
+            stickiness = log(aff['visit_count'] + 1) * stickiness_scale
+            score = aff['ema_reward'] * (1 + stickiness)
+
+        # 10% exploration: fall back to embedding similarity
+        if random() < 0.1:
+            return None
+
+        return best_expert
+
+    def update(self, code_idx, expert_id, reward):
+        aff['ema_reward'] = 0.9 * aff['ema_reward'] + 0.1 * reward
+        aff['visit_count'] += 1
 ```
 
-**Selection formula:**
-```python
-score = ema_reward * (1 + log(visit_count + 1) * stickiness_scale)
-```
-
-- High EMA reward → this expert performs well on this code
-- High visit count → "stickiness" — established mappings are resistant to change
-- Exploration rate (10%) → occasionally try alternatives
-
-### Key Properties
-
-1. **Learning from reward**: Good (code, expert) pairs accumulate positive affinity
-2. **Stickiness grows with evidence**: `log(visit_count)` makes proven mappings harder to displace
-3. **Poor performers can be replaced**: Low EMA reward means another expert can take over
-4. **Exploration**: 10% chance to try embedding similarity instead of affinity
-5. **Graceful fallback**: New codes with no affinity use embedding similarity
-
-### Files Changed
-
-- `core/expert_manager.py`: Added `CodeExpertAffinity` class, modified `retrieve_or_create()` to use affinity-based selection, added `update_affinity()` method
-- `train.py` / notebook: Call `expert_manager.update_affinity(game_reward)` after each game
-
----
-
-## Future Consideration: Gumbel-Softmax
-
-If REINFORCE has high variance or slow convergence, consider:
+### Expert Pruning
 
 ```python
-# In VectorQuantize.forward():
-def forward(self, z, temperature=1.0, hard=True):
-    # Compute logits (negative distances)
-    logits = -distances  # (batch, codebook_size)
-
-    if self.training:
-        # Gumbel-softmax: differentiable sampling
-        y_soft = F.gumbel_softmax(logits, tau=temperature, hard=False)
-        if hard:
-            # Straight-through: hard in forward, soft in backward
-            idx = y_soft.argmax(dim=-1)
-            y_hard = F.one_hot(idx, self.codebook_size).float()
-            y = y_hard - y_soft.detach() + y_soft
-        else:
-            y = y_soft
-        quantized = y @ self.codebook.weight
-    else:
-        # Inference: hard selection
-        idx = logits.argmax(dim=-1)
-        quantized = self.codebook(idx)
-
-    return quantized, idx, loss
+def prune_experts(min_frames=25000, min_affinity_score=0.0, dry_run=True):
+    # Keep if: frames >= threshold OR affinity >= threshold
+    # Protected: active/prefetched experts
+    # On delete: redistribute affinity to similar remaining expert
 ```
 
-This would allow end-to-end gradients from expert value estimates through code selection to RSSM parameters.
-
 ---
 
----
+## Future Directions
 
-## Expert Pruning
+### 1. Address Mode Collapse
 
-### Problem
+The meta-agent learned to route everything to one expert. Options:
+- **Entropy bonus** in REINFORCE to encourage diverse selections
+- **Annealed exploration** in affinity (start high, decay over training)
+- **Per-game routing constraints** ensuring each game has dedicated expert capacity
 
-Training creates many undertrained experts due to:
-1. VQ code clustering creating new codes for visually similar observations
-2. Low epsilon threshold spawning new experts instead of reusing existing ones
-3. Curriculum randomness spreading training across many experts
+### 2. Gumbel-Softmax for End-to-End Gradients
 
-Result: 31 experts for 8 games, with many having only ~12.8K frames (essentially 1 game visit).
-
-### Solution
-
-Added `prune_experts()` method to ExpertManager that removes undertrained experts based on:
-- **min_frames**: Minimum training frames required (default: 25,000 = ~2 game visits)
-- **min_affinity_score**: Minimum affinity score to keep (default: 0.0)
-- **max_experts**: Optional hard cap on expert count
-
+Replace VQ hard selection with differentiable relaxation:
 ```python
-result = expert_manager.prune_experts(
-    min_frames=25000,
-    min_affinity_score=0.0,
-    max_experts=None,  # Optional cap
-    dry_run=True,      # Set False to actually delete
-)
+y_soft = F.gumbel_softmax(logits, tau=temperature, hard=False)
+y_hard = one_hot(y_soft.argmax()) - y_soft.detach() + y_soft  # Straight-through
 ```
+This would allow gradients to flow from expert performance through code selection.
 
-### Pruning Logic
+### 3. Expert Merging
 
-1. Compute composite score for each expert: `frames * (1 + max_affinity_score)`
-2. Experts meeting EITHER threshold (frames OR affinity) are kept
-3. Active/prefetched experts are protected from pruning
-4. When deleting an expert:
-   - Remove from centroids dict
-   - Clean affinity mappings for that expert
-   - Optionally redistribute affinity to most similar remaining expert
-   - Delete from disk storage
+Instead of pruning, merge similar undertrained experts:
+- Average weights of experts with similar centroids
+- Combine affinity mappings
+- Reduces fragmentation while preserving learned representations
 
-### Integration
+### 4. Hierarchical Experts
 
-- **Periodic**: Every 50 days during training, prune experts with <25K frames
-- **Post-training**: Dedicated notebook cells for analysis and manual pruning
-- **Dry run**: Always available to preview what would be pruned
+Add structure within experts:
+- Shared backbone across all experts (lower layers)
+- Expert-specific heads (upper layers)
+- Reduces total parameters while maintaining specialization
 
-### Files Changed
+### 5. Curriculum Learning
 
-- `core/expert_manager.py`: Added `get_expert_stats()`, `prune_experts()`, `_delete_expert()` methods
-- `ooc_moe_colab.ipynb`: Added pruning during training loop and dedicated analysis cells
+Current random/Markov curriculum may not be optimal:
+- **Self-paced**: Focus on games where expert is improving
+- **Adversarial**: Focus on games where expert is struggling
+- **Balanced**: Ensure minimum training per game
+
+### 6. Evaluation Protocol
+
+Need systematic evaluation:
+- Per-game scores vs random policy baseline
+- Transfer: Does training on game A help game B?
+- Forgetting: After training game B, how much does game A degrade?
 
 ---
 
-## Other Notes
+## File Structure
 
-- Unified action space implemented: 6 actions for Breakout+Pong+SpaceInvaders, ~18 for full 8-game set
-- Expert fragmentation was high (23 experts for 8 games) — lowered ε helped concentrate training
-- Pong consistently stuck at -21 (needs investigation, likely sparse reward + long horizon issue)
+```
+ewc_moe_atari/
+├── core/
+│   ├── __init__.py
+│   ├── meta_rssm.py      # Meta-agent with VQ codebook
+│   ├── expert.py         # Actor-critic expert
+│   ├── expert_manager.py # Lifecycle + affinity selection
+│   └── tiered_store.py   # Disk storage
+├── training/
+│   ├── __init__.py
+│   ├── ppo_trainer.py    # PPO implementation
+│   └── rollout_buffer.py # Experience buffer
+├── envs/
+│   ├── __init__.py
+│   ├── atari_wrappers.py # Atari preprocessing
+│   ├── game_curriculum.py # Game scheduling
+│   └── action_space.py   # Unified action space
+├── train.py              # CLI training script
+├── ooc_moe_colab.ipynb   # Colab notebook
+├── Claude.md             # This file
+└── requirements.txt
+```
+
+---
+
+## References
+
+- **VQ-VAE**: van den Oord et al., "Neural Discrete Representation Learning" (2017)
+- **World Models**: Ha & Schmidhuber, "World Models" (2018)
+- **Dreamer**: Hafner et al., "Dream to Control" (2019)
+- **PPO**: Schulman et al., "Proximal Policy Optimization" (2017)
+- **EWC**: Kirkpatrick et al., "Overcoming catastrophic forgetting" (2017)
