@@ -139,19 +139,27 @@ for h_state, code_idx, game_reward in selection_data:
     # Per-selection advantage (not day-level!)
     advantage = game_reward - baseline
 
-    # Recompute log_prob with current parameters
+    # Recompute log_prob and entropy with current parameters
     prior_logits = meta_agent.prior_net(h_state)
     log_prob = F.log_softmax(prior_logits, dim=-1)
+    prior_probs = F.softmax(prior_logits, dim=-1)
     selected_log_prob = log_prob.gather(1, code_idx)
+
+    # Entropy of prior distribution: H(p) = -sum(p * log(p))
+    entropy = -(prior_probs * log_prob).sum(dim=-1)
 
     # Per-selection REINFORCE loss
     losses.append(-advantage * selected_log_prob)
+    entropies.append(entropy)
 
-reinforce_loss = sum(losses)
-reinforce_loss.backward()
+# Total loss: REINFORCE - entropy bonus (minimize loss = maximize entropy)
+total_loss = sum(losses) - entropy_coef * mean(entropies)
+total_loss.backward()
 ```
 
-**Key insight**: Previously all K selections in a day received the same advantage signal (day-level cumulative reward). Now each selection's gradient is scaled by its own game's reward, giving proper credit assignment.
+**Key insights**:
+1. Per-selection credit: Each selection's gradient is scaled by its own game's reward
+2. Entropy bonus: Encourages the prior to maintain diversity over codes, preventing mode collapse
 
 ---
 
@@ -262,7 +270,7 @@ def prune_experts(min_frames=25000, min_affinity_score=0.0, dry_run=True):
 ### 1. Address Mode Collapse
 
 The meta-agent learned to route everything to one expert. Options:
-- **Entropy bonus** in REINFORCE loss to encourage diverse code selections
+- ✅ **Entropy bonus** — IMPLEMENTED: adds `-entropy_coef * H(prior)` to REINFORCE loss, encouraging the prior network to maintain uncertainty over codes
 - **Annealed exploration** in affinity (start high, decay over training)
 - **Load balancing loss** penalizing uneven expert utilization (soft, learned)
 - ✅ **Per-selection credit assignment** — IMPLEMENTED: each code selection now receives its own advantage based on the game's reward, not day-level cumulative reward

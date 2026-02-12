@@ -139,6 +139,7 @@ class MetaRSSM(nn.Module):
         code_dim: int = 32,
         codebook_size: int = 64,
         kl_threshold: float = 2.0,  # Threshold for switch detection
+        entropy_coef: float = 0.01,  # Entropy bonus for diverse code selection
     ):
         super().__init__()
 
@@ -146,6 +147,7 @@ class MetaRSSM(nn.Module):
         self.code_dim = code_dim
         self.codebook_size = codebook_size
         self.kl_threshold = kl_threshold
+        self.entropy_coef = entropy_coef
 
         # Encoder: frames -> abstract features
         self.encoder = CNNEncoder(
@@ -354,6 +356,9 @@ class MetaRSSM(nn.Module):
         The prior network p(code | h) serves as the policy. We reinforce
         code selections that led to high cumulative rewards.
 
+        Includes entropy bonus to encourage diverse code selections and
+        prevent mode collapse to a single expert.
+
         Args:
             cumulative_reward: total reward from K games (used for logging)
             selection_data: list of tuples from day phase. Supports two formats:
@@ -361,8 +366,8 @@ class MetaRSSM(nn.Module):
                 - (h_state, code_idx, game_reward) - per-selection credit assignment
 
         Returns:
-            loss: REINFORCE loss tensor (or None if no selection_data provided)
-            metrics: dict with advantage, baseline, loss value
+            loss: REINFORCE loss + entropy bonus (or None if no selection_data)
+            metrics: dict with advantage, baseline, loss value, prior_entropy
         """
         # Compute REINFORCE loss if selection_data provided
         if selection_data is None or len(selection_data) == 0:
@@ -376,6 +381,7 @@ class MetaRSSM(nn.Module):
             losses = []
             advantages = []
             log_probs_list = []
+            entropies = []
 
             for item in selection_data:
                 h_state, code_idx, game_reward = item
@@ -385,11 +391,16 @@ class MetaRSSM(nn.Module):
                 advantage = reward_tensor - self.baseline
                 advantages.append(advantage.item())
 
-                # Compute log prob under current prior
+                # Compute log prob and entropy under current prior
                 prior_logits = self.prior_net(h_state)
                 log_prob = F.log_softmax(prior_logits, dim=-1)
+                prior_probs = F.softmax(prior_logits, dim=-1)
                 selected_log_prob = log_prob.gather(1, code_idx.unsqueeze(-1)).squeeze(-1)
                 log_probs_list.append(selected_log_prob)
+
+                # Entropy of prior distribution: H(p) = -sum(p * log(p))
+                entropy = -(prior_probs * log_prob).sum(dim=-1)
+                entropies.append(entropy)
 
                 # Per-selection REINFORCE loss
                 losses.append(-advantage.detach() * selected_log_prob)
@@ -402,15 +413,20 @@ class MetaRSSM(nn.Module):
 
             reinforce_loss = torch.stack(losses).sum()
             total_log_prob = torch.stack(log_probs_list).sum()
+            mean_entropy = torch.stack(entropies).mean()
+
+            # Total loss: REINFORCE - entropy bonus (minimize loss = maximize entropy)
+            total_loss = reinforce_loss - self.entropy_coef * mean_entropy
 
             metrics = {
                 'advantage': sum(advantages) / len(advantages),  # Mean advantage
                 'baseline': self.baseline.item(),
                 'reinforce_loss': reinforce_loss.item(),
                 'mean_log_prob': (total_log_prob / len(log_probs_list)).item(),
+                'prior_entropy': mean_entropy.item(),
             }
 
-            return reinforce_loss, metrics
+            return total_loss, metrics
 
         else:
             # Legacy: day-level advantage (all selections get same signal)
@@ -423,23 +439,34 @@ class MetaRSSM(nn.Module):
             self.baseline_count += 1
 
             log_probs = []
+            entropies = []
             for h_state, code_idx in selection_data:
                 prior_logits = self.prior_net(h_state)
                 log_prob = F.log_softmax(prior_logits, dim=-1)
+                prior_probs = F.softmax(prior_logits, dim=-1)
                 selected_log_prob = log_prob.gather(1, code_idx.unsqueeze(-1)).squeeze(-1)
                 log_probs.append(selected_log_prob)
 
+                # Entropy of prior distribution
+                entropy = -(prior_probs * log_prob).sum(dim=-1)
+                entropies.append(entropy)
+
             total_log_prob = torch.stack(log_probs).sum()
+            mean_entropy = torch.stack(entropies).mean()
             reinforce_loss = -advantage.detach() * total_log_prob
+
+            # Total loss: REINFORCE - entropy bonus
+            total_loss = reinforce_loss - self.entropy_coef * mean_entropy
 
             metrics = {
                 'advantage': advantage.item(),
                 'baseline': self.baseline.item(),
                 'reinforce_loss': reinforce_loss.item(),
                 'mean_log_prob': (total_log_prob / len(log_probs)).item(),
+                'prior_entropy': mean_entropy.item(),
             }
 
-            return reinforce_loss, metrics
+            return total_loss, metrics
 
     def get_game_embedding(self, state: MetaRSSMState) -> torch.Tensor:
         """Get current game embedding for expert retrieval."""

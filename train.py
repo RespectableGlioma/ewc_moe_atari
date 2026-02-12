@@ -45,6 +45,7 @@ class DayNightTrainer:
         # Meta-agent params
         meta_lr: float = 1e-4,
         kl_threshold: float = 2.0,
+        entropy_coef: float = 0.01,
         # Expert params
         expert_lr: float = 2.5e-4,
         n_steps_per_update: int = 128,
@@ -85,6 +86,7 @@ class DayNightTrainer:
             code_dim=32,
             codebook_size=64,
             kl_threshold=kl_threshold,
+            entropy_coef=entropy_coef,
         ).to(device)
 
         self.meta_optimizer = Adam(self.meta_agent.parameters(), lr=meta_lr)
@@ -317,6 +319,8 @@ class DayNightTrainer:
             self.writer.add_scalar('night/reinforce_loss', metrics['reinforce_loss'], self.day_count)
         if 'mean_log_prob' in metrics:
             self.writer.add_scalar('night/mean_log_prob', metrics['mean_log_prob'], self.day_count)
+        if 'prior_entropy' in metrics:
+            self.writer.add_scalar('night/prior_entropy', metrics['prior_entropy'], self.day_count)
 
         return metrics
 
@@ -398,6 +402,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-dir", default="./checkpoints")
     parser.add_argument("--log-dir", default="./logs")
+    parser.add_argument("--entropy-coef", type=float, default=0.01,
+                        help="Entropy bonus coefficient for diverse code selection")
     args = parser.parse_args()
 
     curriculum_type = {
@@ -418,6 +424,7 @@ def main():
         save_dir=args.save_dir,
         log_dir=args.log_dir,
         seed=args.seed,
+        entropy_coef=args.entropy_coef,
     )
 
     trainer.train()
