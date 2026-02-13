@@ -158,8 +158,8 @@ class DayNightTrainer:
             game_code = self.meta_agent.get_game_code(meta_state)  # Keep as tensor
 
             # Train game classifier to force discriminative codes
-            game_idx = torch.tensor([self.game_to_idx[game_name]], device=self.device)
-            game_loss, game_acc = self.meta_agent.compute_game_loss(meta_state, game_idx)
+            game_idx_tensor = torch.tensor([self.game_to_idx[game_name]], device=self.device)
+            game_loss, game_acc = self.meta_agent.compute_game_loss(obs, game_idx_tensor)
             self.meta_optimizer.zero_grad()
             game_loss.backward()
             self.meta_optimizer.step()

@@ -292,25 +292,40 @@ class MetaRSSM(nn.Module):
 
     def compute_game_loss(
         self,
-        state: 'MetaRSSMState',
+        obs: torch.Tensor,
         game_idx: torch.Tensor,
     ) -> tuple:
         """
-        Compute game classification loss from VQ embedding.
+        Compute game classification loss from observation.
 
         This forces the codebook to learn game-discriminative representations,
         ensuring different games map to different codes.
 
+        We recompute the forward pass here to get fresh gradients, avoiding
+        issues with in-place GRU operations from a prior forward pass.
+
         Args:
-            state: MetaRSSMState containing z (VQ embedding)
+            obs: (batch, C, H, W) observation
             game_idx: (batch,) ground truth game indices
 
         Returns:
             loss: scalar classification loss
             accuracy: classification accuracy for logging
         """
+        # Encode observation and get VQ embedding
+        e_t = self.encoder(obs)
+
+        # Get posterior embedding (simplified - no GRU, just encode)
+        # Use zero h_state to avoid GRU in-place issues
+        h_zero = torch.zeros(obs.shape[0], self.hidden_dim, device=obs.device)
+        post_input = torch.cat([h_zero, e_t], dim=-1)
+        post_embedding = self.posterior_net(post_input)
+
+        # Quantize
+        z_t, code_idx, _ = self.vq(post_embedding)
+
         # Predict game from VQ embedding
-        game_logits = self.game_classifier(state.z)
+        game_logits = self.game_classifier(z_t)
         loss = F.cross_entropy(game_logits, game_idx)
 
         # Compute accuracy for logging
