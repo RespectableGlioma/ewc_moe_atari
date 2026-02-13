@@ -139,7 +139,9 @@ class MetaRSSM(nn.Module):
         code_dim: int = 32,
         codebook_size: int = 64,
         kl_threshold: float = 2.0,  # Threshold for switch detection
-        entropy_coef: float = 0.01,  # Entropy bonus for diverse code selection
+        entropy_coef: float = 0.1,  # Entropy bonus for diverse code selection
+        num_games: int = 8,  # Number of games for classification loss
+        game_loss_coef: float = 1.0,  # Weight for game classification loss
     ):
         super().__init__()
 
@@ -148,6 +150,8 @@ class MetaRSSM(nn.Module):
         self.codebook_size = codebook_size
         self.kl_threshold = kl_threshold
         self.entropy_coef = entropy_coef
+        self.num_games = num_games
+        self.game_loss_coef = game_loss_coef
 
         # Encoder: frames -> abstract features
         self.encoder = CNNEncoder(
@@ -186,6 +190,14 @@ class MetaRSSM(nn.Module):
             nn.Linear(hidden_dim + code_dim, 128),
             nn.ReLU(),
             nn.Linear(128, codebook_size),
+        )
+
+        # Game classifier: predict game from VQ embedding
+        # Forces codebook to learn game-discriminative representations
+        self.game_classifier = nn.Sequential(
+            nn.Linear(code_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_games),
         )
 
         # Running baseline for night updates (REINFORCE)
@@ -252,12 +264,16 @@ class MetaRSSM(nn.Module):
 
         new_state = MetaRSSMState(h=h_new, z=z_t, code_idx=code_idx)
 
+        # Game classification from VQ embedding
+        game_logits = self.game_classifier(z_t)
+
         outputs = {
             'kl': kl,
             'prior_logits': prior_logits,
             'transition_logits': transition_logits,
             'vq_loss': vq_loss,
             'encoding': e_t,
+            'game_logits': game_logits,
         }
 
         return new_state, outputs
@@ -273,6 +289,36 @@ class MetaRSSM(nn.Module):
             (batch,) boolean tensor indicating switch detected
         """
         return kl > self.kl_threshold
+
+    def compute_game_loss(
+        self,
+        state: 'MetaRSSMState',
+        game_idx: torch.Tensor,
+    ) -> tuple:
+        """
+        Compute game classification loss from VQ embedding.
+
+        This forces the codebook to learn game-discriminative representations,
+        ensuring different games map to different codes.
+
+        Args:
+            state: MetaRSSMState containing z (VQ embedding)
+            game_idx: (batch,) ground truth game indices
+
+        Returns:
+            loss: scalar classification loss
+            accuracy: classification accuracy for logging
+        """
+        # Predict game from VQ embedding
+        game_logits = self.game_classifier(state.z)
+        loss = F.cross_entropy(game_logits, game_idx)
+
+        # Compute accuracy for logging
+        with torch.no_grad():
+            pred = game_logits.argmax(dim=-1)
+            accuracy = (pred == game_idx).float().mean()
+
+        return loss * self.game_loss_coef, accuracy.item()
 
     def get_prefetch_distribution(
         self,

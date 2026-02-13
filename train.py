@@ -79,6 +79,9 @@ class DayNightTrainer:
             seed=seed,
         )
 
+        # Game name to index mapping for classification loss
+        self.game_to_idx = {game: idx for idx, game in enumerate(games)}
+
         # Meta-agent
         self.meta_agent = MetaRSSM(
             obs_shape=(4, 84, 84),
@@ -87,6 +90,7 @@ class DayNightTrainer:
             codebook_size=64,
             kl_threshold=kl_threshold,
             entropy_coef=entropy_coef,
+            num_games=len(games),
         ).to(device)
 
         self.meta_optimizer = Adam(self.meta_agent.parameters(), lr=meta_lr)
@@ -152,6 +156,19 @@ class DayNightTrainer:
             meta_state, meta_outputs = self.meta_agent(obs, meta_state)
             game_embedding = self.meta_agent.get_game_embedding(meta_state)
             game_code = self.meta_agent.get_game_code(meta_state)  # Keep as tensor
+
+            # Train game classifier to force discriminative codes
+            game_idx = torch.tensor([self.game_to_idx[game_name]], device=self.device)
+            game_loss, game_acc = self.meta_agent.compute_game_loss(meta_state, game_idx)
+            self.meta_optimizer.zero_grad()
+            game_loss.backward()
+            self.meta_optimizer.step()
+            self.writer.add_scalar('meta/game_accuracy', game_acc, self.global_step)
+
+            # Re-run forward pass after game classifier update (codes may have shifted)
+            meta_state, meta_outputs = self.meta_agent(obs, meta_state)
+            game_embedding = self.meta_agent.get_game_embedding(meta_state)
+            game_code = self.meta_agent.get_game_code(meta_state)
 
             # Store h_state and code_idx for later (we'll add reward after training)
             h_state_for_reinforce = meta_state.h.detach().clone()
@@ -402,7 +419,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-dir", default="./checkpoints")
     parser.add_argument("--log-dir", default="./logs")
-    parser.add_argument("--entropy-coef", type=float, default=0.01,
+    parser.add_argument("--entropy-coef", type=float, default=0.1,
                         help="Entropy bonus coefficient for diverse code selection")
     args = parser.parse_args()
 

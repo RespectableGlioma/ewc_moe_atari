@@ -254,6 +254,26 @@ class CodeExpertAffinity:
         aff['visit_count'] += 1
 ```
 
+### Game Classification Loss
+
+The VQ codebook was collapsing — all games mapped to similar codes. We added a supervised loss to force discriminative codes:
+
+```python
+# In MetaRSSM
+self.game_classifier = nn.Sequential(
+    nn.Linear(code_dim, 64), nn.ReLU(), nn.Linear(64, num_games)
+)
+
+def compute_game_loss(self, state, game_idx):
+    game_logits = self.game_classifier(state.z)  # Predict game from VQ embedding
+    return F.cross_entropy(game_logits, game_idx)
+```
+
+This forces:
+- Different games → different VQ codes (discriminative codebook)
+- Same game → same code (consistent routing)
+- Natural basis for expert specialization
+
 ### Expert Pruning
 
 ```python
@@ -270,6 +290,7 @@ def prune_experts(min_frames=25000, min_affinity_score=0.0, dry_run=True):
 ### 1. Address Mode Collapse
 
 The meta-agent learned to route everything to one expert. Options:
+- ✅ **Game classification loss** — IMPLEMENTED: forces the VQ codebook to learn game-discriminative representations by training a classifier to predict game from VQ embedding. Different games → different codes → natural expert specialization.
 - ✅ **Entropy bonus** — IMPLEMENTED: adds `-entropy_coef * H(prior)` to REINFORCE loss, encouraging the prior network to maintain uncertainty over codes
 - **Annealed exploration** in affinity (start high, decay over training)
 - **Load balancing loss** penalizing uneven expert utilization (soft, learned)
